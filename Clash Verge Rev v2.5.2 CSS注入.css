@@ -1,0 +1,128 @@
+/* ===== 左侧选项卡 ===== */
+/* 假设左侧抽屉类名包含 MuiDrawer-root，且是第一个抽屉（左） */
+/* 左侧导航项 —— 仅当位于主界面左侧抽屉内时 */
+[class*='MuiDrawer-root']:first-of-type [class*='MuiListItem-root'] {
+  padding: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  color: #fff !important;
+  /* 只在这里变白 */
+  border-radius: 4px;
+}
+
+[class*='MuiDrawer-root']:first-of-type [class*='MuiListItem-root'][class*='Mui-selected'] {
+  background-color: #007aff !important;
+}
+
+.base-container {
+  padding: 0 !important;
+}
+
+/* 重置设置页文字颜色（根据实际类名调整） */
+[role='tabpanel'] * {
+  /* 如果设置页是 tabpanel 角色 */
+  color: #000 !important;
+  /* 或继承 */
+}
+
+/* ===== 中间代理信息 ===== */
+/* 定位到主内容区的Paper，通常位于main内，可用 main [class*="MuiPaper-root"] */
+main [class*='MuiPaper-root']:nth-of-type(1) {
+  /* 假设第一个Paper是代理信息 */
+  flex: 1;
+  padding: 16px;
+  background-color: rgba(255, 255, 255, 0.5);
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* 代理名称——如果文本有特定类，可用文本选择，否则用父级限定 */
+.proxy-name {
+  /* 若页面中确实有该class，原样保留 */
+  font-size: 20px;
+  font-weight: bold;
+  margin-bottom: 8px;
+}
+
+.proxy-link {
+  color: #007aff;
+  text-decoration: none;
+}
+
+/* ===== 右侧节点选择 ===== */
+/* 可能是一个单独的Drawer或Card，假设类包含 MuiDrawer-root 且是第二个 */
+[class*='MuiDrawer-root']:nth-of-type(2) {
+  width: 300px !important;
+  padding: 16px;
+  background-color: rgba(255, 255, 255, 0.9);
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* 节点列表容器 */
+.node-list {
+  /* 如果页面有该class，直接使用；否则用具体元素 */
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.node-item {
+  padding: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  background-color: #f0f0f0;
+}
+
+.node-item:hover {
+  background-color: #e0e0e0;
+}
+
+/* ===== 流量统计 ===== */
+/* 固定在右上角，可能是一个Popper或Box */
+/* 若包含traffic类 */
+[class*='traffic'] {
+  padding: 16px;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* 或使用更具体的：header [class*="MuiBox-root"]:last-child 等 */
+/* 确保主区域（通常为main或section）是flex布局 */
+main {
+  display: flex !important;
+  flex-direction: row;
+  align-items: stretch;
+  /* 使子项等高 */
+}
+
+/* 同时可能需要调整左侧和右侧抽屉的 flex-shrink */
+[class*='MuiDrawer-root']:first-of-type {
+  flex-shrink: 0;
+}
+
+[class*='MuiDrawer-root']:nth-of-type(2) {
+  flex-shrink: 0;
+}
+
+/* 浅色主题 */
+@media (prefers-color-scheme: light) {
+  body {
+    background-image: url('background.png') !important;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    opacity: 0.5;
+  }
+}
+
+/* 深色主题 */
+@media (prefers-color-scheme: dark) {
+  body {
+    background-image: url('background.png') !important;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    opacity: 0.75;
+  }
+}
