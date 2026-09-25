@@ -1,0 +1,12 @@
+Primary Color #FFC0CB
+Secondary Color #FF9F0A
+Primary Text #FFFFFF
+Secondary Text #EBEBF599
+Info Color #66CCFF
+Warning Color #FF9F0A
+Error Color #FF453A
+Success Color #30D158
+Font Family 微软雅黑
+
+酒红色
+Primary Color #ff797e

@@ -1,10 +1,11 @@
 :root,
 :scope {
   --cv-wallpaper: url('https://raw.githubusercontent.com/camy-x/clash-verge-rev-glass-theme/main/assets/wallpaper.jpg');
+
   --cv-wp-filter: none;
 
   --cv-scrim: rgba(6, 8, 14, 0.5);
-  --cv-backdrop: rgba(6, 8, 14, 0);
+
   --cv-panel: transparent;
   --cv-border: rgba(255, 255, 255, 0.37);
   --cv-border-soft: rgba(255, 255, 255, 0.13);
@@ -31,8 +32,9 @@
   --cv-subpanel: rgba(255, 255, 255, 0.05);
   --cv-chip-bg: rgba(255, 255, 255, 0.1);
   --cv-input-bg: rgba(0, 0, 0, 0.27);
-  --cv-overlay-bg: rgba(18, 20, 28, 0.5);
+  --cv-overlay-bg: rgba(18, 20, 28, 0.8);
   --cv-tooltip-bg: rgba(13, 15, 22, 0.94);
+  --cv-backdrop: rgba(6, 8, 14, 0.45);
   --cv-overlay-shadow: rgba(0, 0, 0, 0.4);
   --cv-scrollbar: rgba(255, 255, 255, 0.22);
   --cv-scrollbar-hover: rgba(255, 255, 255, 0.34);
@@ -52,8 +54,6 @@
 }
 
 body {
-  position: relative !important;
-  isolation: isolate !important;
   background-color: var(--cv-body-bg) !important;
 }
 
@@ -120,7 +120,7 @@ body::after {
   margin: 2px 0;
   border: 1px solid transparent !important;
   border-radius: var(--cv-radius) !important;
-  color: var(--cv-text);
+  color: var(--cv-text) !important;
   background: transparent !important;
   transition:
     background-color 0.14s ease,
@@ -686,184 +686,4 @@ body *::-webkit-scrollbar-thumb:hover {
 body .the_titlebar {
   background: transparent !important;
   border-bottom: 1px solid var(--cv-border-soft) !important;
-}
-
-/* =========================
-   Monaco Theme
-   ========================= */
-
-body .monaco-editor {
-  --vscode-editor-background: transparent !important;
-  --vscode-editorGutter-background: transparent !important;
-  --vscode-minimap-background: transparent !important;
-
-  --vscode-editor-foreground: rgba(255, 255, 255, 0.92) !important;
-
-  --vscode-editorLineNumber-foreground: rgba(255, 255, 255, 0.5) !important;
-
-  --vscode-editorLineNumber-activeForeground: rgba(255, 255, 255, 0.9) !important;
-
-  --vscode-editor-selectionBackground: rgba(90, 176, 248, 0.3) !important;
-
-  --vscode-editor-lineHighlightBackground: transparent !important;
-
-  --vscode-editor-lineHighlightBorder: transparent !important;
-
-  --vscode-editorBracketMatch-border: transparent !important;
-
-  --vscode-focusBorder: transparent !important;
-}
-
-/* =========================
-   Monaco Background
-   ========================= */
-
-body .monaco-editor,
-body .monaco-editor .overflow-guard,
-body .monaco-editor .monaco-scrollable-element,
-body .monaco-editor .editor-scrollable,
-body .monaco-editor .monaco-editor-background,
-body .monaco-editor .margin,
-body .monaco-editor .lines-content,
-body .monaco-editor .view-overlays {
-  background: transparent !important;
-  background-color: transparent !important;
-  background-image: none !important;
-}
-
-/* =========================
-   Line Numbers
-   ========================= */
-
-body .monaco-editor .margin {
-  background: transparent !important;
-}
-
-body .monaco-editor .line-numbers {
-  color: rgba(255, 255, 255, 0.5) !important;
-}
-
-body .monaco-editor .active-line-number {
-  color: rgba(255, 255, 255, 0.9) !important;
-}
-
-/* =========================
-   Current Line
-   ========================= */
-
-body .monaco-editor .current-line {
-  background: rgba(255, 255, 255, 0.018) !important;
-  border: none !important;
-}
-
-/* =========================
-   MiniMap Container
-   ========================= */
-
-body .monaco-editor .minimap {
-  position: relative !important;
-  isolation: isolate !important;
-}
-
-/* =========================
-   MiniMap Glass Tint
-   ========================= */
-
-body .monaco-editor .minimap::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)), rgba(10, 12, 18, 0.1);
-  pointer-events: none;
-  z-index: 1;
-}
-
-/* =========================
-   MiniMap Decorations
-   ========================= */
-
-body .monaco-editor .minimap-decorations-layer {
-  background: transparent !important;
-}
-
-/* =========================
-   MiniMap Slider
-   ========================= */
-
-/* body .monaco-editor .minimap-slider,
-body .monaco-editor .minimap-slider-horizontal {
-  background:
-    rgba(255, 255, 255, 0.08) !important;
-
-  border: none !important;
-
-  box-shadow: none !important;
-
-  opacity: 0.8 !important;
-} */
-
-/* body .monaco-editor .minimap-slider:hover,
-body .monaco-editor .minimap-slider-horizontal:hover {
-  background:
-    rgba(255, 255, 255, .12) !important;
-} */
-
-/* =========================
-   Overview Ruler
-   ========================= */
-
-/* body .monaco-editor .decorationsOverviewRuler {
-  display: none !important;
-} */
-
-/* =========================
-   Monaco Scrollbar
-   ========================= */
-
-body .monaco-editor .scrollbar {
-  background: transparent !important;
-}
-
-body .monaco-editor .scrollbar .slider {
-  background: rgba(255, 255, 255, 0.18) !important;
-
-  border-radius: 999px !important;
-}
-
-body .monaco-editor .scrollbar .slider:hover {
-  background: rgba(255, 255, 255, 0.3) !important;
-}
-
-/* =========================
-   Suggest Widget
-   ========================= */
-
-body .monaco-editor .suggest-widget,
-body .monaco-editor .parameter-hints-widget {
-  background: rgba(18, 20, 28, 0.72) !important;
-
-  border: 1px solid var(--cv-border-soft) !important;
-
-  -webkit-backdrop-filter: blur(18px) saturate(1.4) !important;
-
-  backdrop-filter: blur(18px) saturate(1.4) !important;
-
-  box-shadow:
-    0 12px 36px rgba(0, 0, 0, 0.42),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
-}
-
-/* =========================
-   Find Widget
-   ========================= */
-
-body .monaco-editor .find-widget {
-  background: rgba(18, 20, 28, 0.72) !important;
-
-  border: 1px solid var(--cv-border-soft) !important;
-
-  -webkit-backdrop-filter: blur(18px) saturate(1.4) !important;
-
-  backdrop-filter: blur(18px) saturate(1.4) !important;
 }
