@@ -1,0 +1,34 @@
+- id: ID_275b1du3
+  version: v1.0.0
+  name: 阿里云盘自动签到
+  description: 阿里云盘自动签到，可配合计划任务系统。
+  tags: []
+  type: File
+  url: ''
+  status: 0
+  path: data/plugins/plugin-aliyunpan-signin-v1.0.js
+  triggers:
+    - on::manual
+  hasUI: false
+  menus:
+    管理 RefreshToken: ManageTokens
+  context:
+    profiles: {}
+    subscriptions: {}
+    rulesets: {}
+    plugins: {}
+    scheduledtasks: {}
+  configuration:
+    - id: ID_ID_uk78m9en
+      title: RefreshToken列表
+      description: 支持多个账号
+      key: RefreshTokenList
+      component: InputList
+      value:
+        - 83126bdf8bd142418a1d4f5ec17f028c
+        - af50d55939ad40c4bec84dd1b30de9a1
+        - 91243f2d00414888926006a2dbb3cfe0
+      options: []
+  disabled: false
+  install: false
+  installed: false

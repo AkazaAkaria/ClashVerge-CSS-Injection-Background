@@ -1,0 +1,31 @@
+- id: ID_7lfd5k52
+  version: v1.0.0
+  name: 自定义主题
+  description: 通过修改css变量，实现任意主题配色！
+  tags: []
+  group: ''
+  type: File
+  url: ''
+  status: 0
+  path: data/plugins/plugin-custom-singbox-theme.js
+  triggers:
+    - on::manual
+    - on::ready
+  hasUI: false
+  menus:
+    选择本地图片: SelectImage
+    在线图片导入: OnlineImage
+    CSS 注入: CustomCSS
+    自定义图标: CustomIcon
+    选择纯色背景: Select
+    清除自定义背景图: ClearImage
+    清除主题: Clear
+    重置配置: Reset
+  context:
+    profiles: {}
+    subscriptions: {}
+    rulesets: {}
+    plugins: {}
+    scheduledtasks: {}
+  configuration: []
+  disabled: false

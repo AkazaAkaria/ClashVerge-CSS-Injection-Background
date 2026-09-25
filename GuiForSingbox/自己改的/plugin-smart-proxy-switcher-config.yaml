@@ -1,0 +1,228 @@
+- id: ID_zmm7aqqj
+  version: v1.6.0
+  name: 节点智能切换
+  group: Extensions
+  description: 实现动态代理选择机制，包含故障转移、断路器、EWMA 延迟跟踪、基于分数调度、滞后控制、当前节点快速健康检测与新节点暖机。
+  tags:
+    - 提升体验
+    - 功能扩展
+  type: File
+  url: ''
+  path: data/plugins/plugin-smart-proxy-switcher-simple.js
+  triggers:
+    - on::manual
+    - on::ready
+    - on::core::started
+    - on::core::stopped
+  hasUI: true
+  menus:
+    启动: Start
+    停止: Stop
+  context:
+    profiles: {}
+    subscriptions: {}
+    rulesets: {}
+    plugins: {}
+    scheduledtasks: {}
+  configuration:
+    - id: ID_pxpbp262
+      title: 使用场景
+      description: 哪种使用场景更适合你？
+      key: Preset
+      component: Radio
+      value: Stable
+      options:
+        - 稳定型,Stable
+        - 延迟优先型,LatencyFirst
+        - 自定义型,Custom
+
+    - id: ID_fe2ext3m
+      title: 应用智能切换的策略组
+      description: 在列表中添加你要应用智能切换的策略组名称
+      key: IncludeGroup
+      component: InputList
+      value:
+        - 🚀 节点选择
+      options: []
+
+    - id: ID_53zg977v
+      title: 并发检测数量
+      description: 同时检测的节点数量。节点较多时提高并发可缩短整轮检测时间，但会增加核心 API 和网络请求压力。
+      key: ConcurrencyLimit
+      component: Input
+      value: '20'
+      options: []
+
+    - id: ID_0j5oj2fv
+      title: 检测时间间隔(ms)
+      description: 控制全节点竞争检测的频率。每轮检测完成后再等待指定时间开始下一轮。更大的数值更省资源，更小的数值更新代理状态更及时。
+      key: MonitoringInterval
+      component: Input
+      value: '120000'
+      options: []
+
+    - id: ID_6k2p9m4a
+      title: 当前节点快速检测间隔(ms)
+      description: 只检测当前正在使用的节点，用于更快发现当前节点故障。默认30秒，不会按这个频率检测整个节点池。
+      key: CurrentCheckInterval
+      component: Input
+      value: '30000'
+      options: []
+
+    - id: ID_7qv3n1hx
+      title: 当前节点连续失败次数
+      description: 当前节点快速健康检测连续失败多少次后立即触发故障转移。默认2次，仍受每小时最大切换次数限制。
+      key: CurrentFailureThreshold
+      component: Input
+      value: '2'
+      options: []
+
+    - id: ID_jad56pmh
+      title: 节点健康检测超时时间(ms)
+      description: 单个节点健康检测允许等待的最长时间。更大的数值更宽容慢节点，更小的数值能更快排除无响应节点。
+      key: RequestTimeout
+      component: Input
+      value: '10000'
+      options: []
+
+    - id: ID_uqj8thoe
+      title: 切换冷却时间(ms)
+      description: 切换一次代理后，多久内禁止再次自动切换。当前节点发生故障时可绕过此冷却，但仍受每小时切换次数限制。
+      key: SwitchCooldown
+      component: Input
+      value: '300000'
+      options: []
+
+    - id: ID_76uhvuu6
+      title: 最大切换次数(每小时)
+      description: 防止网络波动导致频繁切换。故障救火也受此限制。
+      key: MaxSwitchPerHour
+      component: Input
+      value: '10'
+      options: []
+
+    - id: ID_ktzcar7y
+      title: 代理测试链接
+      description: 同一个监测会话固定使用一个测试链接；填写多个地址时只在启动监测时随机选择一次，避免 EWMA 混入不同 URL 的延迟基线。
+      key: TestUrlList
+      component: InputList
+      value:
+        - https://www.gstatic.com/generate_204
+      options: []
+
+    - id: ID_qslmfrva
+      title: 稳定型
+      description: 减少切换，容忍波动，适合日常长期挂机
+      key: StableMode
+      component: CodeEditor
+      value: |
+        {
+          "ewmaAlpha": 0.1,
+          "_ewmaAlpha": "更平滑，更看重历史表现",
+          "failureThreshold": 5,
+          "_failureThreshold": "更容忍失败，不容易触发全节点断路",
+          "hysteresisMargin": 30.0,
+          "_hysteresisMargin": "候选至少快30ms才允许切换,减少切换频率，保持更稳定",
+          "latencyWeight": 50.0,
+          "_latencyWeight": "降低延迟影响，更重视稳定性",
+          "stabilityWeight": 100,
+          "_stabilityWeight": "节点稳定率权重",
+          "penaltyDecayRate": 0.002,
+          "_penaltyDecayRate": "每秒指数衰减；0.002的半衰期约5.8分钟"
+        }
+      options: []
+
+    - id: ID_cqum4do9
+      title: 延迟优先型
+      description: 严格追求低延迟，适合对响应速度要求较高的场景
+      key: LatencyFirstMode
+      component: CodeEditor
+      value: |
+        {
+          "ewmaAlpha": 0.5,
+          "_ewmaAlpha": "更敏感，延迟波动响应更快",
+          "failureThreshold": 4,
+          "_failureThreshold": "更快识别故障，更敏捷",
+          "hysteresisMargin": 10,
+          "_hysteresisMargin": "更敏感，容易发生代理抖动",
+          "latencyWeight": 200.0,
+          "_latencyWeight": "更关注低延迟",
+          "stabilityWeight": 20,
+          "_stabilityWeight": "节点稳定率权重",
+          "penaltyDecayRate": 0.002,
+          "_penaltyDecayRate": "每秒指数衰减；0.002的半衰期约5.8分钟"
+        }
+      options: []
+
+    - id: ID_xa46mkur
+      title: 自定义型
+      description: 对切换策略进行微调，适合高级玩家
+      key: CustomMode
+      component: CodeEditor
+      value: |
+        {
+          "ewmaAlpha": 0.3,
+          "_ewmaAlpha": "作用：控制 EWMA 对延迟的记忆程度，默认值：0.3",
+          "_ewmaAlpha增大": "更敏感，延迟波动响应更快",
+          "_ewmaAlpha减小": "更平滑，更看重历史表现",
+          "_ewmaAlpha提示": "适合根据网络抖动强度调节灵敏度",
+
+          "failureThreshold": 4,
+          "_failureThreshold": "作用：连续失败几次后触发断路器，默认值：4",
+          "_failureThreshold增大": "更容忍失败，不容易触发断路",
+          "_failureThreshold减小": "更快识别故障，更敏捷",
+          "_failureThreshold提示": "影响代理因失败被判为不可用的门槛",
+
+          "circuitBreakerTimeout": 120000,
+          "_circuitBreakerTimeout": "作用：断路器打开后等待多长时间重试，默认值：120000（2分钟）",
+          "_circuitBreakerTimeout增大": "断路持续更久，降低恢复频率",
+          "_circuitBreakerTimeout减小": "更早尝试恢复，有可能误恢复",
+          "_circuitBreakerTimeout提示": "适合根据代理恢复速度调整重试间隔",
+
+          "penaltyIncrement": 5,
+          "_penaltyIncrement": "作用：每次失败后累加的惩罚值，默认值：5",
+          "_penaltyIncrement增大": "失败惩罚更重，代理得分下降更快",
+          "_penaltyIncrement减小": "更宽容失败，不易被替换",
+          "_penaltyIncrement提示": "影响失败事件对代理选择的惩罚力度",
+
+          "penaltyDecayRate": 0.002,
+          "_penaltyDecayRate": "作用：每秒指数衰减速率；0.002的半衰期约5.8分钟",
+          "_penaltyDecayRate增大": "惩罚恢复更快，代理更容易被原谅",
+          "_penaltyDecayRate减小": "惩罚持续时间更长，慎重切换回来",
+          "_penaltyDecayRate提示": "控制失败历史影响持续多久",
+
+          "priorityWeight": 1.0,
+          "_priorityWeight": "作用：优先级在综合评分中的权重，默认值：1.0",
+          "_priorityWeight增大": "更倾向优先使用高优先级代理",
+          "_priorityWeight减小": "更注重实际性能而非设定优先级",
+          "_priorityWeight提示": "反映系统对预设偏好程度的信任",
+
+          "latencyWeight": 100.0,
+          "_latencyWeight": "作用：延迟在综合评分中的权重，默认值：100.0",
+          "_latencyWeight增大": "更关注低延迟，代理切换更频繁",
+          "_latencyWeight减小": "更稳定，允许较高延迟代理被选中",
+          "_latencyWeight提示": "决定系统是否更看重实时响应性能",
+
+          "penaltyWeight": 1.0,
+          "_penaltyWeight": "作用：惩罚值在综合评分中的权重，默认值：1.0",
+          "_penaltyWeight增大": "历史失败更影响评分，代理更难被重新使用",
+          "_penaltyWeight减小": "惩罚影响弱化，更容易容忍曾失败的代理",
+          "_penaltyWeight提示": "影响失败代理重新进入候选池的难度",
+
+          "hysteresisMargin": 50,
+          "_hysteresisMargin": "作用：候选至少比当前快多少毫秒才允许切换，默认值：20",
+          "_hysteresisMargin增大": "减少切换频率，保持更稳定",
+          "_hysteresisMargin减小": "更敏感，容易发生代理抖动",
+          "_hysteresisMargin提示": "防止分数接近时频繁切换（抖动）",
+
+          "stabilityWeight": 50,
+          "_stabilityWeight": "作用：节点稳定率在综合评分中的权重，默认值：50",
+          "_stabilityWeight增大": "更重视节点长期稳定表现，失败率较高的节点更难被选中，减少切换频率",
+          "_stabilityWeight减小": "降低稳定率影响，更关注实时延迟性能，代理切换会更加敏感",
+          "_stabilityWeight提示": "控制系统对历史可用性的信任程度，适合根据网络环境波动情况调整"
+        }
+      options: []
+  status: 1
+  disabled: false
+  install: false
+  installed: false
