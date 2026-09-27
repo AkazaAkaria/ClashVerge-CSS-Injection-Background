@@ -1,4 +1,4 @@
-/* VERSION: v11.7-patch1 */
+/* VERSION: v11.7-patch1-url-layout-reference-restored */
 const CONSTANTS = {
   PATHS: {
     THEME: 'data/third/custom-singbox-theme',
@@ -6,7 +6,6 @@ const CONSTANTS = {
     ICON_FACTORY: 'data/third/custom-singbox-theme/icons/original',
     CACHE: 'data/.cache',
     ICON_CACHE: 'data/.cache/icons',
-    IMG_CACHE: 'data/.cache/imgs',
     CUSTOM_BG: 'data/third/custom-singbox-theme/custom_bg',
     CUSTOM_CSS: 'data/third/custom-singbox-theme/custom.css',
   },
@@ -210,6 +209,7 @@ const ICON_EXT = ICON_ENV.ext
 const ICON_TEMP_PREFIX = '.custom_icon_'
 const VARIABLE_STYLE_ID = `${Plugin.id}_theme_variables`
 const THEME_MODAL_STYLE_ID = `${Plugin.id}_theme_modal_style`
+const THEME_MODAL_STYLE_VERSION = '20260926.3'
 const CUSTOM_STYLE_ID = `${Plugin.id}_custom_css`
 const FILE_SIZE_UNKNOWN = -1
 const MAX_IMAGE_SIZE_MB = CONSTANTS.LIMITS.MAX_IMAGE_SIZE_MB
@@ -227,6 +227,9 @@ const DEFAULT_CONFIG = {
   variable: {},
   backgroundIndex: 0,
   customBackground: '',
+  backgroundUrlEnabled: false,
+  backgroundUrls: [],
+  customCSSEnabled: false,
   customCSSPath: '',
 }
 
@@ -236,6 +239,11 @@ const errText = (error, fallback = '未知错误') => {
   if (typeof error === 'string' && error.trim()) return error
   if (isPlainObject(error) && typeof error.message === 'string' && error.message.trim()) return error.message
   return fallback
+}
+const isRetriableNetworkError = (message) => {
+  const text = String(message || '').toLowerCase()
+  if (!text) return false
+  return ['timeout', 'timed out', 'deadline exceeded', 'connection reset', 'connection refused', 'connection closed', 'broken pipe', 'network is unreachable', 'temporary failure', 'temporarily unavailable', 'eof', 'reset by peer', 'unexpected eof'].some((token) => text.includes(token))
 }
 const confirmDialog = async (title, message) => {
   try {
@@ -254,8 +262,9 @@ const isValidCustomBackgroundPath = (path) => {
 
 // 归一化背景索引
 const normalizeBackgroundIndex = (index) => {
-  if (typeof index !== 'number') return 0
-  return Math.max(0, Math.min(index, BACKGROUND_VARIABLE_LIST.length - 1))
+  const value = Number(index)
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(Math.floor(value), BACKGROUND_VARIABLE_LIST.length - 1))
 }
 /*
  * 主题配置里只记录 custom.css 的「文件名」，不记录完整路径：
@@ -270,6 +279,54 @@ const normalizeCustomCSSPath = (value) => {
   if (!name || name === '.' || name === '..') return ''
   return /^[^/\\:*?"<>|]+\.css$/i.test(name) ? name : ''
 }
+const createBackgroundUrlId = () => Plugins.sampleID()
+const normalizeBackgroundUrlKey = (url) => {
+  if (typeof url !== 'string') return ''
+  const text = url.trim()
+  if (!text) return ''
+  try {
+    const normalized = new URL(text)
+    normalized.protocol = normalized.protocol.toLowerCase()
+    normalized.hostname = normalized.hostname.toLowerCase()
+    return normalized.href
+  } catch {
+    return text
+  }
+}
+const isValidBackgroundUrlCachePath = (path) => typeof path === 'string' && /^custom_bg_url_[a-zA-Z0-9_-]+\.(jpg|jpeg|png|webp|gif|avif)$/i.test(path)
+const normalizeBackgroundUrlWeight = (weight) => {
+  const value = Number(weight)
+  if (!Number.isFinite(value)) return 10
+  return Math.max(1, Math.min(10, Math.round(value)))
+}
+const normalizeBackgroundUrlEntry = (entry) => {
+  const safe = isPlainObject(entry) ? entry : {}
+  const url = typeof safe.url === 'string' ? safe.url.trim() : ''
+  const id = typeof safe.id === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(safe.id.trim()) ? safe.id.trim() : createBackgroundUrlId()
+  const cachePath = isValidBackgroundUrlCachePath(safe.cachePath) ? safe.cachePath : ''
+  return {
+    id,
+    url,
+    enabled: safe.enabled !== false,
+    weight: normalizeBackgroundUrlWeight(safe.weight),
+    cachePath,
+  }
+}
+const normalizeBackgroundUrls = (value) => {
+  if (!Array.isArray(value)) return []
+  const seenIds = new Set()
+  const seenUrls = new Set()
+  const result = []
+  for (const rawEntry of value) {
+    const entry = normalizeBackgroundUrlEntry(rawEntry)
+    const urlKey = normalizeBackgroundUrlKey(entry.url)
+    if (!entry.url || seenIds.has(entry.id) || seenUrls.has(urlKey)) continue
+    seenIds.add(entry.id)
+    seenUrls.add(urlKey)
+    result.push(entry)
+  }
+  return result
+}
 const normalizeConfig = (config) => {
   const safeConfig = isPlainObject(config) ? config : {}
   const normalizedVariable = {}
@@ -281,20 +338,23 @@ const normalizeConfig = (config) => {
     }
   }
   const customBackground = isValidCustomBackgroundPath(safeConfig.customBackground) ? safeConfig.customBackground : ''
-  /*
-   * 记录 custom.css 的「文件名」，便于外部/宿主按主题配置定位自定义 CSS 文件。
-   */
+  const backgroundUrls = normalizeBackgroundUrls(safeConfig.backgroundUrls)
+  const backgroundUrlEnabled = safeConfig.backgroundUrlEnabled === true
+  const customCSSEnabled = safeConfig.customCSSEnabled === true
   const customCSSPath = normalizeCustomCSSPath(safeConfig.customCSSPath)
-  // 删除历史 HTTPS 外链开关字段，避免继续持久化旧策略。
-  const configWithoutLegacyExternalPolicy = { ...safeConfig }
-  delete configWithoutLegacyExternalPolicy.allowExternalHttps
-  return {
-    ...configWithoutLegacyExternalPolicy,
+  const normalized = {
+    ...safeConfig,
     variable: normalizedVariable,
     backgroundIndex: normalizeBackgroundIndex(safeConfig.backgroundIndex),
     customBackground,
+    backgroundUrlEnabled,
+    backgroundUrls,
+    customCSSEnabled,
     customCSSPath,
   }
+  delete normalized.backgroundUrl
+  delete normalized.allowExternalHttps
+  return normalized
 }
 const parseConfigText = (raw) => {
   if (typeof raw !== 'string' || !raw.trim()) return null
@@ -326,14 +386,18 @@ const getCachedConfig = async () => {
   }
 }
 const saveConfig = async (config) => {
-  const content = JSON.stringify(config, null, 2)
-  if (!parseConfigText(content)) {
-    throw new Error('配置序列化校验失败')
+  const normalized = normalizeConfig(config)
+  const content = JSON.stringify(normalized, null, 2)
+  try {
+    const parsed = JSON.parse(content)
+    if (!isPlainObject(parsed)) throw new Error('配置必须是对象')
+  } catch (error) {
+    throw new Error(`配置序列化校验失败：${errText(error)}`)
   }
   await atomicWriteFile(THEME_FILE, content)
-  configCache = config // 更新缓存
+  configCache = normalized
   configCacheTime = Date.now()
-  return config
+  return normalized
 }
 /*
  * 说明：GUI.for.SingBox 宿主并不提供 enqueueThemeOperation，这里自行实现一个自包含的
@@ -355,43 +419,6 @@ const checkRuntime = (context = 'Operation', generation = runtimeGeneration) => 
     throw createCancelledError()
   }
 }
-/*
- * 一次性迁移：把存量配置里遗留的「完整路径」改写成「文件名」。
- * normalizeConfig 只在读取时于内存里归一，不会回写磁盘，
- * 所以老配置（如 data/third/custom-singbox-theme/custom.css）
- * 必须显式改写一次，否则 singbox-themes.json 里会一直是完整路径。
- * 采用「原地改写 + 保留未知字段」，避免丢掉未来新增或宿主写入的其它键。
- */
-let configMigrated = false
-const migrateStoredConfig = async () => {
-  if (configMigrated) return
-  try {
-    const raw = await Plugins.ReadFile(THEME_FILE)
-    if (typeof raw !== 'string' || !raw.trim()) {
-      configMigrated = true
-      return
-    }
-    const parsed = JSON.parse(raw)
-    if (!isPlainObject(parsed)) {
-      configMigrated = true
-      return
-    }
-    const normalizedCSSPath = normalizeCustomCSSPath(parsed.customCSSPath)
-    if (parsed.customCSSPath === normalizedCSSPath) {
-      configMigrated = true
-      return
-    }
-    const next = {
-      ...parsed,
-      customCSSPath: normalizedCSSPath,
-    }
-    await atomicWriteFile(THEME_FILE, JSON.stringify(next, null, 2))
-    configMigrated = true
-    console.log(`[CustomTheme] 已迁移主题配置：customCSSPath "${parsed.customCSSPath}" -> "${normalizedCSSPath}"`)
-  } catch (error) {
-    console.warn('[CustomTheme] 迁移主题配置失败（下次继续重试）:', error)
-  }
-}
 const safeRemoveFile = async (path) => {
   try {
     await Plugins.RemoveFile(path)
@@ -407,20 +434,60 @@ const removeFileOrThrow = async (path) => {
     throw new Error(`删除文件失败：${path}`)
   }
 }
-/* 使用宿主正式暴露的文件系统 API，不再维护旧版 ReadDir / Stat 兼容层。 */
-const getDirEntries = async (dirPath) => {
-  try {
-    const entries = await Plugins.ReadDir(dirPath)
-    return Array.isArray(entries) ? entries : []
-  } catch {
-    return []
-  }
-}
-const fileExists = (path) => Plugins.FileExists(path)
 const removeAllCustomBackgroundsStrict = async () => {
   for (const extension of FEATURES_IMAGE_FORMATS) {
-    await removeFileOrThrow(`${CUSTOM_BG_PREFIX}${extension}`)
+    const path = `${CUSTOM_BG_PREFIX}${extension}`
+    if (await Plugins.FileExists(path)) await removeFileOrThrow(path)
   }
+}
+const isUrlBackgroundCacheFileName = (name) => /^custom_bg_url_[a-zA-Z0-9_-]+\.(jpg|jpeg|png|webp|gif|avif)$/i.test(String(name || ''))
+const getUrlBackgroundCacheEntries = async () => {
+  const entries = await Plugins.ReadDir(PATH)
+  return entries.map((entry) => entry?.name).filter((name) => isUrlBackgroundCacheFileName(name))
+}
+const removeAllUrlBackgroundCachesStrict = async () => {
+  const names = await getUrlBackgroundCacheEntries()
+  for (const name of names) {
+    const path = `${PATH}/${name}`
+    if (await Plugins.FileExists(path)) await removeFileOrThrow(path)
+  }
+}
+const removeBackgroundUrlEntry = async (id) => {
+  const current = await getCachedConfig()
+  const entries = Array.isArray(current.backgroundUrls) ? current.backgroundUrls : []
+  const target = entries.find((entry) => entry.id === id)
+  if (!target) return false
+  const extraTargets = target.cachePath ? [{ path: `${PATH}/${target.cachePath}`, name: target.cachePath }] : []
+  let savedConfig = current
+  await executeBackgroundTransaction(
+    async () => {
+      const latest = await getCachedConfig()
+      const nextConfig = normalizeConfig({
+        ...latest,
+        backgroundUrls: (Array.isArray(latest.backgroundUrls) ? latest.backgroundUrls : []).filter((entry) => entry.id !== id),
+      })
+      savedConfig = await saveConfig(nextConfig)
+      if (target.cachePath && (await Plugins.FileExists(`${PATH}/${target.cachePath}`))) {
+        await removeFileOrThrow(`${PATH}/${target.cachePath}`)
+      }
+      if (activeBackgroundUrlId === id) activeBackgroundUrlId = null
+    },
+    { extraTargets },
+  )
+  return savedConfig
+}
+const commitThemeReset = async (newConfig) => {
+  const cacheNames = await getUrlBackgroundCacheEntries()
+  const extraTargets = cacheNames.map((name) => ({ path: `${PATH}/${name}`, name }))
+  return executeBackgroundTransaction(
+    async () => {
+      await saveConfig(newConfig)
+      await removeAllCustomBackgroundsStrict()
+      await removeAllUrlBackgroundCachesStrict()
+      activeBackgroundUrlId = null
+    },
+    { extraTargets },
+  )
 }
 const getTempFilePath = (prefix = 'temp') => {
   const timestamp = Date.now()
@@ -429,7 +496,7 @@ const getTempFilePath = (prefix = 'temp') => {
 }
 const cleanupPluginTempFiles = async () => {
   try {
-    const cacheEntries = await getDirEntries('data/.cache')
+    const cacheEntries = await Plugins.ReadDir('data/.cache')
     for (const entry of cacheEntries) {
       const name = entry.name
       if (typeof name !== 'string') continue
@@ -440,7 +507,7 @@ const cleanupPluginTempFiles = async () => {
     // atomicWriteFile 的 .new/.bak 与正式文件同目录，因此位于 PATH。
     // 这里只清理插件自己的两个正式文件；BackgroundTX 专用 .bak
     // 仍由 journal/recovery 管理，避免误删可恢复事务备份。
-    const pluginEntries = await getDirEntries(PATH)
+    const pluginEntries = await Plugins.ReadDir(PATH)
     for (const entry of pluginEntries) {
       const name = entry.name
       if (name === 'singbox-themes.json.new' || name === 'singbox-themes.json.bak' || name === `${CUSTOM_CSS_NAME}.new` || name === `${CUSTOM_CSS_NAME}.bak`) {
@@ -452,40 +519,75 @@ const cleanupPluginTempFiles = async () => {
   }
 }
 const getOwnedIconPaths = () => OWNED_ICON_NAMES.flatMap((name) => [`${ICON_CACHE_DIR}/${name}_dark${ICON_EXT}`, `${ICON_CACHE_DIR}/${name}_light${ICON_EXT}`])
-const saveCustomCSSText = async (css) => {
+const saveCustomCSSText = async (css, enabled = null) => {
   const normalized = typeof css === 'string' ? css : ''
 
   const currentConfig = await getCachedConfig()
+  const previousConfig = normalizeConfig(currentConfig)
+  const previousConfigExists = await Plugins.FileExists(THEME_FILE)
+  const previousCSSExists = await Plugins.FileExists(CUSTOM_CSS_FILE)
+  let previousCSS = ''
+  if (previousCSSExists) {
+    try {
+      const rawPreviousCSS = await Plugins.ReadFile(CUSTOM_CSS_FILE)
+      previousCSS = typeof rawPreviousCSS === 'string' ? rawPreviousCSS : ''
+    } catch (error) {
+      throw new Error(`读取原有 CSS 失败，已取消保存：${errText(error)}`)
+    }
+  }
+
   const nextCSSPath = normalized.trim() ? CUSTOM_CSS_NAME : ''
+  const nextEnabled = enabled === null ? currentConfig.customCSSEnabled === true : enabled === true
   const nextConfig = normalizeConfig({
     ...currentConfig,
     customCSSPath: nextCSSPath,
+    customCSSEnabled: nextEnabled && !!normalized.trim(),
   })
 
-  // 在写入前保留旧 CSS；如果配置提交失败，尽量回滚 CSS，避免“CSS 已保存但策略仍旧”的不一致。
-  let previousCSS = ''
-  try {
-    const rawPreviousCSS = await Plugins.ReadFile(CUSTOM_CSS_FILE)
-    previousCSS = typeof rawPreviousCSS === 'string' ? rawPreviousCSS : ''
-  } catch {}
+  const restoreSnapshot = async () => {
+    if (previousCSSExists) {
+      await atomicWriteFile(CUSTOM_CSS_FILE, previousCSS)
+    } else {
+      await safeRemoveFile(CUSTOM_CSS_FILE)
+    }
 
-  await atomicWriteFile(CUSTOM_CSS_FILE, normalized)
-  /*
-   * 把 custom.css 的「文件名」同步写回主题配置 singbox-themes.json，
-   * 便于外部/宿主按配置定位自定义 CSS 文件（目录由插件 PATH 决定，不入配置）。
-   * CSS 有内容时记录文件名，被清空时移除记录；同步失败不影响 CSS 已写入的结果。
-   */
+    if (previousConfigExists) {
+      await saveConfig(previousConfig)
+    } else {
+      await safeRemoveFile(THEME_FILE)
+      configCache = null
+      configCacheTime = 0
+    }
+  }
+
   try {
+    await atomicWriteFile(CUSTOM_CSS_FILE, normalized)
     await saveConfig(nextConfig)
+
+    // 保存成功后立即验证两个持久化结果；任一验证失败都回滚两边。
+    const persistedCSSRaw = await Plugins.ReadFile(CUSTOM_CSS_FILE)
+    const persistedCSS = typeof persistedCSSRaw === 'string' ? persistedCSSRaw : ''
+    if (persistedCSS !== normalized) {
+      throw new Error('CSS 保存失败：磁盘内容与编辑器内容不一致')
+    }
+
+    const persistedConfigRaw = await Plugins.ReadFile(THEME_FILE)
+    const persistedConfig = parseConfigText(persistedConfigRaw)
+    if (!persistedConfig || persistedConfig.customCSSPath !== nextConfig.customCSSPath || persistedConfig.customCSSEnabled !== nextConfig.customCSSEnabled) {
+      throw new Error('主题配置保存失败：custom.css 开关或路径未同步')
+    }
+
+    configCache = persistedConfig
+    configCacheTime = Date.now()
+    return normalized
   } catch (error) {
     try {
-      await atomicWriteFile(CUSTOM_CSS_FILE, previousCSS)
+      await restoreSnapshot()
     } catch (rollbackError) {
-      console.error('[CustomTheme] CSS 回滚失败:', rollbackError)
+      console.error('[CustomTheme] CSS 与配置回滚失败:', rollbackError)
     }
     throw error
   }
-  return normalized
 }
 const cleanupIconTempFiles = async () => {
   try {
@@ -506,8 +608,8 @@ const ensureFactoryIconBackup = async () => {
   let backed = 0
   for (const finalPath of getOwnedIconPaths()) {
     const backupPath = getFactoryIconPath(finalPath)
-    if (await fileExists(backupPath)) continue
-    if (!(await fileExists(finalPath))) continue
+    if (await Plugins.FileExists(backupPath)) continue
+    if (!(await Plugins.FileExists(finalPath))) continue
     try {
       await Plugins.CopyFile(finalPath, backupPath)
       backed++
@@ -522,7 +624,7 @@ const resetOwnedIcons = async () => {
   const pending = []
   for (const finalPath of getOwnedIconPaths()) {
     const backupPath = getFactoryIconPath(finalPath)
-    if (await fileExists(backupPath)) {
+    if (await Plugins.FileExists(backupPath)) {
       try {
         await safeRemoveFile(finalPath)
         await Plugins.CopyFile(backupPath, finalPath)
@@ -579,7 +681,7 @@ const installOwnedIcons = async (staged, token) => {
     for (const item of nextPaths) {
       const backupPath = getIconTransactionBackupPath(item.finalPath, token)
       await safeRemoveFile(backupPath)
-      if (await fileExists(item.finalPath)) {
+      if (await Plugins.FileExists(item.finalPath)) {
         await Plugins.CopyFile(item.finalPath, backupPath)
         backups.push({
           finalPath: item.finalPath,
@@ -620,7 +722,7 @@ const installOwnedIcons = async (staged, token) => {
      */
     for (const item of backups) {
       try {
-        if (item.backupPath && (await fileExists(item.backupPath))) {
+        if (item.backupPath && (await Plugins.FileExists(item.backupPath))) {
           await safeRemoveFile(item.finalPath)
           await Plugins.CopyFile(item.backupPath, item.finalPath)
         } else {
@@ -677,36 +779,26 @@ const purgeLegacyFiles = async () => {
     }
   } catch {}
 }
-const cleanupOrphanBackgroundTransactionFiles = async () => {
+const cleanupOrphanFileTransactionFiles = async (prefix = BACKGROUND_TX_PREFIX, logTag = 'FileTX') => {
   try {
-    const entries = await getDirEntries('data/.cache')
+    const entries = await Plugins.ReadDir('data/.cache')
     const journalTokens = new Set()
     for (const entry of entries) {
       const name = entry.name
-      if (typeof name === 'string' && name.startsWith(BACKGROUND_TX_PREFIX) && name.endsWith('.json')) {
-        const token = name.slice(BACKGROUND_TX_PREFIX.length, -5)
-        if (token) {
-          journalTokens.add(token)
-        }
+      if (typeof name === 'string' && name.startsWith(prefix) && name.endsWith('.json')) {
+        const token = name.slice(prefix.length, -5)
+        if (token) journalTokens.add(token)
       }
     }
     for (const entry of entries) {
       const name = entry.name
-      if (typeof name !== 'string' || !name.startsWith(BACKGROUND_TX_PREFIX) || !name.endsWith('.bak')) {
-        continue
-      }
-      const body = name.slice(BACKGROUND_TX_PREFIX.length, -4)
+      if (typeof name !== 'string' || !name.startsWith(prefix) || !name.endsWith('.bak')) continue
+      const body = name.slice(prefix.length, -4)
       const matchedToken = Array.from(journalTokens).some((token) => body === token || body.startsWith(`${token}_`))
-      /*
-       * 只有确定不存在对应 journal
-       * 才允许删除 backup。
-       */
-      if (!matchedToken) {
-        await safeRemoveFile(`data/.cache/${name}`)
-      }
+      if (!matchedToken) await safeRemoveFile(`data/.cache/${name}`)
     }
   } catch (error) {
-    console.warn('[BackgroundTX] 清理孤儿事务备份失败:', error)
+    console.warn(`[${logTag}] 清理孤儿事务备份失败:`, error)
   }
 }
 const ensurePluginDirectories = async () => {
@@ -718,6 +810,36 @@ const ensurePluginDirectories = async () => {
     }
   }
 }
+const repairConfigMigrations = async () => {
+  const cachedConfig = await getCachedConfig()
+  let persistedConfig = null
+  try {
+    const raw = await Plugins.ReadFile(THEME_FILE)
+    const parsed = JSON.parse(raw)
+    if (isPlainObject(parsed)) persistedConfig = parsed
+  } catch {}
+
+  let nextConfig = normalizeConfig(persistedConfig || cachedConfig)
+
+  const customCSSExists = await Plugins.FileExists(CUSTOM_CSS_FILE)
+  let rawCSS = ''
+  if (customCSSExists) {
+    try {
+      rawCSS = await Plugins.ReadFile(CUSTOM_CSS_FILE)
+    } catch {}
+  }
+  const expectedPath = customCSSExists && typeof rawCSS === 'string' && rawCSS.trim() ? CUSTOM_CSS_NAME : ''
+  if (nextConfig.customCSSPath !== expectedPath) {
+    nextConfig = { ...nextConfig, customCSSPath: expectedPath }
+  }
+
+  const sourceConfig = persistedConfig || cachedConfig
+  const changed = JSON.stringify(sourceConfig) !== JSON.stringify(nextConfig)
+  if (changed) {
+    return saveConfig(nextConfig)
+  }
+  return nextConfig
+}
 const startup = async () => {
   await ensurePluginDirectories()
   /*
@@ -727,7 +849,7 @@ const startup = async () => {
    * 否则未来 purge 规则可能误删事务文件。
    */
   await recoverBackgroundTransactions()
-  await cleanupOrphanBackgroundTransactionFiles()
+  await repairConfigMigrations()
   await purgeLegacyFiles()
   await cleanupIconTempFiles()
   await cleanupPluginTempFiles()
@@ -768,7 +890,7 @@ const getFileSize = async (path) => {
   const separatorIndex = path.lastIndexOf('/')
   const dirPath = separatorIndex < 0 ? '.' : path.substring(0, separatorIndex)
   const fileName = path.substring(separatorIndex + 1)
-  const entries = await getDirEntries(dirPath)
+  const entries = await Plugins.ReadDir(dirPath)
   const entry = entries.find((item) => item?.name === fileName)
   return typeof entry?.size === 'number' ? entry.size : FILE_SIZE_UNKNOWN
 }
@@ -928,7 +1050,6 @@ const applyPresetBackground = (index) => {
   releaseBackgroundObjectUrl()
   return applyPresetBackgroundStyle(index)
 }
-const previewPresetBackground = applyPresetBackgroundStyle
 const clearBackgroundImage = () => {
   releaseBackgroundObjectUrl()
   document.body.style.backgroundColor = ''
@@ -981,9 +1102,8 @@ const setTemporaryBackgroundImage = (objectUrl) => {
   markBackgroundMutation()
   return true
 }
-const loadCustomBackground = async (config) => {
-  const relativePath = config?.customBackground
-  if (!isValidCustomBackgroundPath(relativePath)) return null
+const loadBackgroundImageFile = async (relativePath) => {
+  if (!isValidCustomBackgroundPath(relativePath) && !isValidBackgroundUrlCachePath(relativePath)) return null
   const filePath = `${PATH}/${relativePath}`
   const extension = relativePath.substring(relativePath.lastIndexOf('.')).toLowerCase()
   try {
@@ -997,18 +1117,144 @@ const loadCustomBackground = async (config) => {
     const blob = base64ToBlob(base64, detected.mimeType)
     if (!blob || blob.size !== blobSize) return null
     const objectUrl = URL.createObjectURL(blob)
-    return { objectUrl, filePath, extension, mimeType: detected.mimeType }
+    return { objectUrl, filePath, relativePath, extension, mimeType: detected.mimeType }
   } catch (error) {
-    console.warn('[CustomTheme] 加载自定义背景失败:', error)
+    console.warn('[CustomTheme] 加载背景文件失败:', relativePath, error)
     return null
   }
 }
-const setBackground = async (config, ctx = null) => {
+const loadCustomBackground = async (config) => loadBackgroundImageFile(config?.customBackground)
+let activeBackgroundUrlId = null
+const getEnabledBackgroundUrls = (config) => (Array.isArray(config?.backgroundUrls) ? config.backgroundUrls : []).filter((entry) => entry.enabled && entry.url)
+const pickWeightedBackgroundUrl = (entries) => {
+  if (!Array.isArray(entries) || !entries.length) return null
+  const totalWeight = entries.reduce((sum, entry) => sum + normalizeBackgroundUrlWeight(entry.weight), 0)
+  if (totalWeight <= 0) return null
+  let cursor = Math.random() * totalWeight
+  for (const entry of entries) {
+    cursor -= normalizeBackgroundUrlWeight(entry.weight)
+    if (cursor < 0) return entry
+  }
+  return entries[entries.length - 1]
+}
+const getBackgroundUrlCachePath = (entry, extension = '') => {
+  const normalizedExtension = extension === '.jpeg' ? '.jpg' : extension
+  if (isValidBackgroundUrlCachePath(entry?.cachePath)) {
+    const cachedExtension = entry.cachePath.substring(entry.cachePath.lastIndexOf('.')).toLowerCase()
+    if (!normalizedExtension || cachedExtension === normalizedExtension) return entry.cachePath
+  }
+  const safeExt = FEATURES_IMAGE_FORMATS.includes(extension) ? extension : '.jpg'
+  return `custom_bg_url_${String(entry?.id || createBackgroundUrlId()).replace(/[^a-zA-Z0-9_-]/g, '_')}${safeExt}`
+}
+/*
+ * URL 动态背景：
+ * - 启动刷新时从 enabled URL 中按 weight 加权随机。
+ * - 请求失败且该 URL 有缓存时使用自己的缓存。
+ * - 请求失败且没有缓存时，从剩余候选继续按 weight 随机。
+ * - 全部失败后回退普通背景。
+ */
+const refreshDynamicUrlBackgroundEntry = async (entry, ctx = null) => {
+  let url
+  try {
+    url = validateImageUrl(entry.url)
+  } catch (error) {
+    console.warn('[CustomTheme] URL 动态背景无效，跳过:', entry.url, errText(error))
+    return { applied: false, error, noCache: true }
+  }
   ctx?.assertActive()
-  const normalized = config // 直接使用配置，减少normalize调用
-  if (normalized.customBackground) {
-    const filePath = `${PATH}/${normalized.customBackground}`
-    const loaded = await loadCustomBackground(normalized)
+  try {
+    const data = await downloadOnlineImage(url, () => !!ctx && !ctx.isActive())
+    ctx?.assertActive()
+    const currentConfig = await getCachedConfig()
+    const currentEntry = (Array.isArray(currentConfig.backgroundUrls) ? currentConfig.backgroundUrls : []).find((item) => item.id === entry.id)
+    const cachePath = getBackgroundUrlCachePath(currentEntry || entry, data.extension)
+    const stalePaths = []
+    if (currentEntry?.cachePath && currentEntry.cachePath !== cachePath) stalePaths.push(currentEntry.cachePath)
+    const nextEntries = (Array.isArray(currentConfig.backgroundUrls) ? currentConfig.backgroundUrls : []).map((item) => (item.id === entry.id ? { ...item, url, cachePath, enabled: item.enabled !== false, weight: normalizeBackgroundUrlWeight(item.weight) } : item))
+    const result = await saveImageBinary({
+      extension: data.extension,
+      existingTempPath: data.tempPath,
+      targetRelativePath: cachePath,
+      staleRelativePaths: stalePaths,
+      updateCustomBackground: false,
+      configPatch: {
+        backgroundUrls: nextEntries,
+      },
+    })
+    ctx?.assertActive()
+    const loaded = await loadBackgroundImageFile(result.config.backgroundUrls.find((item) => item.id === entry.id)?.cachePath || cachePath)
+    ctx?.assertActive()
+    if (!loaded?.objectUrl) throw new Error('动态背景已下载，但本地缓存加载失败')
+    applyBackgroundObjectUrl(loaded.objectUrl)
+    activeBackgroundUrlId = entry.id
+    return { applied: true, updated: true, config: result.config, size: data.size, entry: result.config.backgroundUrls.find((item) => item.id === entry.id) }
+  } catch (error) {
+    if (error?.cancelled || errText(error) === 'ONLINE_IMPORT_CANCELLED' || (ctx && !ctx.isActive())) {
+      throw createCancelledError()
+    }
+    console.warn('[CustomTheme] 动态背景请求失败:', entry.url, errText(error))
+    return { applied: false, error }
+  }
+}
+const tryCachedBackgroundUrlEntry = async (entry, ctx = null, config = null) => {
+  const cachePath = entry?.cachePath
+  if (!isValidBackgroundUrlCachePath(cachePath)) return null
+  const loaded = await loadBackgroundImageFile(cachePath)
+  if (ctx && !ctx.isActive()) {
+    if (loaded?.objectUrl) {
+      try {
+        URL.revokeObjectURL(loaded.objectUrl)
+      } catch {}
+    }
+    throw createCancelledError()
+  }
+  if (!loaded?.objectUrl) return null
+  applyBackgroundObjectUrl(loaded.objectUrl)
+  activeBackgroundUrlId = entry.id
+  return { applied: true, config: config || null }
+}
+const applyDynamicBackground = async (config, ctx = null, options = {}) => {
+  const candidates = getEnabledBackgroundUrls(config)
+  if (!candidates.length) return { applied: false, config }
+
+  if (options.refreshDynamicUrl === true) {
+    const remaining = [...candidates]
+    while (remaining.length) {
+      ctx?.assertActive()
+      const entry = pickWeightedBackgroundUrl(remaining)
+      if (!entry) break
+      const index = remaining.findIndex((item) => item.id === entry.id)
+      if (index >= 0) remaining.splice(index, 1)
+      const refreshed = await refreshDynamicUrlBackgroundEntry(entry, ctx)
+      if (refreshed?.applied) return refreshed
+      const cached = await tryCachedBackgroundUrlEntry(entry, ctx, config)
+      if (cached?.applied) return cached
+    }
+    activeBackgroundUrlId = null
+    return { applied: false, config }
+  }
+
+  const active = candidates.find((entry) => entry.id === activeBackgroundUrlId)
+  if (active) {
+    const cached = await tryCachedBackgroundUrlEntry(active, ctx, config)
+    if (cached?.applied) return cached
+  }
+  for (const entry of candidates) {
+    const cached = await tryCachedBackgroundUrlEntry(entry, ctx, config)
+    if (cached?.applied) return cached
+  }
+  return { applied: false, config }
+}
+const setBackground = async (config, ctx = null, options = {}) => {
+  ctx?.assertActive()
+  if (config?.backgroundUrlEnabled) {
+    const dynamicApplied = await applyDynamicBackground(config, ctx, options)
+    if (dynamicApplied?.applied) return dynamicApplied
+  }
+
+  if (config?.customBackground) {
+    const filePath = `${PATH}/${config.customBackground}`
+    const loaded = await loadBackgroundImageFile(config.customBackground)
     if (ctx && !ctx.isActive()) {
       if (loaded?.objectUrl) {
         try {
@@ -1019,25 +1265,21 @@ const setBackground = async (config, ctx = null) => {
     }
     if (loaded?.objectUrl) {
       applyBackgroundObjectUrl(loaded.objectUrl)
-      return true
+      return { applied: true, config }
     }
-    if (!(await fileExists(filePath))) {
-      const repaired = { ...normalized, customBackground: '' }
-      try {
-        await saveConfig(repaired)
-      } catch (error) {
-        console.warn('[CustomTheme] 清理缺失背景配置失败:', error)
-        return false
-      }
+    if (!(await Plugins.FileExists(filePath))) {
+      const repaired = await saveConfig({ ...config, customBackground: '' })
       applyPresetBackground(repaired.backgroundIndex)
-      return true
+      return { applied: true, config: repaired }
     }
-    console.warn('[CustomTheme] 自定义背景文件存在但无法加载，保持当前背景与配置不变')
-    return false
+    console.warn('[CustomTheme] 自定义背景文件存在但无法加载，回退到预设背景但保留原配置文件，便于用户恢复。')
+    ctx?.assertActive()
+    applyPresetBackground(config.backgroundIndex)
+    return { applied: true, config }
   }
   ctx?.assertActive()
-  applyPresetBackground(normalized.backgroundIndex)
-  return true
+  applyPresetBackground(config?.backgroundIndex)
+  return { applied: true, config }
 }
 /* 【P0 修复】可回滚文件写入：先写 .new，再备份 .bak，最后替换；优先 MoveFile，失败时降级 CopyFile。 */
 const atomicWriteFile = async (targetPath, contentOrSource, isBinary = false) => {
@@ -1051,7 +1293,7 @@ const atomicWriteFile = async (targetPath, contentOrSource, isBinary = false) =>
       await Plugins.WriteFile(newPath, contentOrSource)
     }
     // 2. 备份旧文件 (如果存在)
-    if (await fileExists(targetPath)) {
+    if (await Plugins.FileExists(targetPath)) {
       await Plugins.CopyFile(targetPath, bakPath)
     }
     // 3. 原子替换 (MoveFile 通常在同一文件系统下是原子的)
@@ -1068,7 +1310,7 @@ const atomicWriteFile = async (targetPath, contentOrSource, isBinary = false) =>
     return true
   } catch (error) {
     console.error('[AtomicWrite] 失败，尝试回滚:', error)
-    if (await fileExists(bakPath)) {
+    if (await Plugins.FileExists(bakPath)) {
       try {
         await Plugins.CopyFile(bakPath, targetPath)
       } catch {}
@@ -1082,7 +1324,7 @@ const atomicWriteFile = async (targetPath, contentOrSource, isBinary = false) =>
 const atomicMoveFile = async (sourcePath, targetPath) => {
   const bakPath = `${targetPath}.bak`
   try {
-    if (await fileExists(targetPath)) {
+    if (await Plugins.FileExists(targetPath)) {
       await Plugins.CopyFile(targetPath, bakPath)
     }
     try {
@@ -1095,7 +1337,7 @@ const atomicMoveFile = async (sourcePath, targetPath) => {
     await safeRemoveFile(bakPath)
     return true
   } catch (error) {
-    if (await fileExists(bakPath)) {
+    if (await Plugins.FileExists(bakPath)) {
       try {
         await Plugins.CopyFile(bakPath, targetPath)
       } catch {}
@@ -1105,204 +1347,145 @@ const atomicMoveFile = async (sourcePath, targetPath) => {
   }
 }
 /* =========================================================
- * Background Transaction
+ * File Transaction
  *
- * 负责：
- * 1. themes.json
- * 2. custom_bg.*
- *
- * 实现：
- * - snapshot：事务开始前备份旧状态
- * - journal：记录事务是否完成
- * - rollback：失败/异常恢复
- * - startup recovery：程序下次启动自动恢复未完成事务
- *
- * 注意：
- * 这是跨多个文件的“可恢复事务”，
- * 不是文件系统层面的真正 ACID 事务。
+ * 通用的可恢复多文件事务引擎。
+ * - caller supplies exact baseTargets / extraTargets
+ * - snapshot / journal / commit / rollback / recovery 由公共层处理
+ * - Background 只是它的一个默认配置
  * ========================================================= */
 const BACKGROUND_TX_PREFIX = '.custom-singbox-bg-tx-'
 const BACKGROUND_TX_VERSION = 1
-const getBackgroundTransactionToken = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
-const getBackgroundTransactionJournalPath = (token) => `data/.cache/${BACKGROUND_TX_PREFIX}${token}.json`
-const getBackgroundTransactionBackupPath = (token, name) => `data/.cache/${BACKGROUND_TX_PREFIX}${token}_${name}.bak`
-const getBackgroundSnapshotTargets = (extraTargets = []) => {
-  const targets = [
-    {
-      path: THEME_FILE,
-      name: 'singbox-themes.json',
-    },
-    ...FEATURES_IMAGE_FORMATS.map((extension) => ({
-      path: `${CUSTOM_BG_PREFIX}${extension}`,
-      name: `custom_bg${extension}`,
-    })),
-    ...extraTargets,
-  ]
+const getFileTransactionToken = () => `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+const getFileTransactionJournalPath = (prefix, token) => `data/.cache/${prefix}${token}.json`
+const getFileTransactionBackupPath = (prefix, token, name) => `data/.cache/${prefix}${token}_${name}.bak`
+const getUniqueTransactionTargets = (baseTargets = [], extraTargets = []) => {
   const seen = new Set()
-  return targets.filter((item) => {
-    if (seen.has(item.path)) {
-      return false
-    }
+  return [...baseTargets, ...extraTargets].filter((item) => {
+    if (!item || typeof item.path !== 'string' || !item.path) return false
+    if (seen.has(item.path)) return false
     seen.add(item.path)
     return true
   })
 }
-const cleanupBackgroundTransactionFiles = async (transaction) => {
+const cleanupFileTransactionFiles = async (transaction) => {
   if (!transaction) return
+  const prefix = typeof transaction.prefix === 'string' && transaction.prefix ? transaction.prefix : BACKGROUND_TX_PREFIX
   try {
-    if (transaction.journalPath) {
-      await safeRemoveFile(transaction.journalPath)
-    }
+    if (transaction.journalPath) await safeRemoveFile(transaction.journalPath)
   } catch {}
   for (const item of transaction.targets || []) {
-    if (item.backupPath) {
-      await safeRemoveFile(item.backupPath)
-    }
+    if (item.backupPath) await safeRemoveFile(item.backupPath)
   }
-  /*
-   * 即使 targets 不完整，也根据 token 再做一次兜底清理。
-   */
   if (transaction.token) {
     try {
-      const entries = await getDirEntries('data/.cache')
+      const entries = await Plugins.ReadDir('data/.cache')
       for (const entry of entries) {
         const name = entry.name
-        if (typeof name === 'string' && name.startsWith(`${BACKGROUND_TX_PREFIX}${transaction.token}_`) && name.endsWith('.bak')) {
+        if (typeof name === 'string' && name.startsWith(`${prefix}${transaction.token}_`) && name.endsWith('.bak')) {
           await safeRemoveFile(`data/.cache/${name}`)
         }
       }
     } catch {}
   }
 }
-const snapshotBackgroundState = async (token, extraTargets = []) => {
+const snapshotFileTransactionState = async (token, { prefix = BACKGROUND_TX_PREFIX, baseTargets = [], extraTargets = [] } = {}) => {
   const targets = []
-  const sourceTargets = getBackgroundSnapshotTargets(extraTargets)
+  const sourceTargets = getUniqueTransactionTargets(baseTargets, extraTargets)
   try {
     for (const target of sourceTargets) {
-      const existed = await fileExists(target.path)
-      const backupPath = existed ? getBackgroundTransactionBackupPath(token, target.name) : null
+      const existed = await Plugins.FileExists(target.path)
+      const name = target.name || String(target.path).split('/').pop()
+      const backupPath = existed ? getFileTransactionBackupPath(prefix, token, name) : null
       if (existed) {
         await safeRemoveFile(backupPath)
         await Plugins.CopyFile(target.path, backupPath)
-        /*
-         * 备份后再次检查，避免 CopyFile 表面成功但结果异常。
-         */
-        if (!(await fileExists(backupPath))) {
-          throw new Error(`事务备份失败：${target.path}`)
-        }
+        if (!(await Plugins.FileExists(backupPath))) throw new Error(`事务备份失败：${target.path}`)
       }
-      targets.push({
-        path: target.path,
-        name: target.name,
-        existed,
-        backupPath,
-      })
+      targets.push({ path: target.path, name, existed, backupPath })
     }
     return targets
   } catch (error) {
-    /*
-     * snapshot 阶段失败：
-     * 事务尚未建立 journal，
-     * 所以只需要清理已经生成的备份。
-     */
     for (const item of targets) {
-      if (item.backupPath) {
-        await safeRemoveFile(item.backupPath)
-      }
+      if (item.backupPath) await safeRemoveFile(item.backupPath)
     }
     throw error
   }
 }
-const restoreBackgroundSnapshot = async (transaction) => {
-  if (!transaction?.targets) {
-    throw new Error('事务快照不存在')
-  }
+const restoreFileTransactionSnapshot = async (transaction) => {
+  if (!transaction?.targets) throw new Error('事务快照不存在')
   const errors = []
-  /*
-   * 1. 先删除当前文件
-   */
   for (const item of transaction.targets) {
     try {
       const removed = await safeRemoveFile(item.path)
-      if (!removed && (await fileExists(item.path))) {
-        errors.push(`${item.path}: 删除当前文件失败`)
-      }
+      if (!removed && (await Plugins.FileExists(item.path))) errors.push(`${item.path}: 删除当前文件失败`)
     } catch (error) {}
   }
-  /*
-   * 2. 恢复事务开始前的文件
-   */
   for (const item of transaction.targets) {
     if (!item.existed || !item.backupPath) continue
     try {
-      if (!(await fileExists(item.backupPath))) {
-        throw new Error('事务备份文件不存在')
-      }
+      if (!(await Plugins.FileExists(item.backupPath))) throw new Error('事务备份文件不存在')
       await Plugins.CopyFile(item.backupPath, item.path)
     } catch (error) {
       errors.push(`${item.path}: 恢复失败：${errText(error)}`)
     }
   }
-  if (errors.length) {
-    throw new Error(`背景事务回滚失败：\n${errors.join('\n')}`)
-  }
+  if (errors.length) throw new Error(`文件事务回滚失败：\n${errors.join('\n')}`)
   return true
 }
-const beginBackgroundTransaction = async (extraTargets = []) => {
-  const token = getBackgroundTransactionToken()
-  const journalPath = getBackgroundTransactionJournalPath(token)
-  const targets = await snapshotBackgroundState(token, extraTargets)
-  /*
-   * 阶段 2：
-   * 所有 backup 都成功以后，才建立 prepared journal。
-   */
-  const transaction = {
-    version: BACKGROUND_TX_VERSION,
-    token,
-    journalPath,
-    phase: 'prepared',
-    targets,
-  }
+const beginFileTransaction = async (options = {}) => {
+  const prefix = options.prefix || BACKGROUND_TX_PREFIX
+  const version = options.version ?? BACKGROUND_TX_VERSION
+  const token = getFileTransactionToken()
+  const journalPath = getFileTransactionJournalPath(prefix, token)
+  const targets = await snapshotFileTransactionState(token, options)
+  const transaction = { version, prefix, token, journalPath, phase: 'prepared', targets }
   try {
     await atomicWriteFile(journalPath, JSON.stringify(transaction, null, 2))
   } catch (error) {
-    await cleanupBackgroundTransactionFiles({
-      ...transaction,
-      targets,
-    })
+    await cleanupFileTransactionFiles(transaction)
     throw error
   }
   return transaction
 }
-const markBackgroundTransactionCommitted = async (transaction) => {
-  const committed = {
-    ...transaction,
-    phase: 'committed',
-  }
+const markFileTransactionCommitted = async (transaction) => {
+  const committed = { ...transaction, phase: 'committed' }
   await atomicWriteFile(transaction.journalPath, JSON.stringify(committed, null, 2))
   return committed
 }
-const executeBackgroundTransaction = async (mutate, options = {}) => {
-  const transaction = await beginBackgroundTransaction(options.extraTargets || [])
+const executeFileTransaction = async (mutate, options = {}) => {
+  const transaction = await beginFileTransaction(options)
   try {
     await mutate(transaction)
-    const committed = await markBackgroundTransactionCommitted(transaction)
-    await cleanupBackgroundTransactionFiles(committed)
+    const committed = await markFileTransactionCommitted(transaction)
+    await cleanupFileTransactionFiles(committed)
     return true
   } catch (error) {
     let rollbackSucceeded = false
     try {
-      await restoreBackgroundSnapshot(transaction)
+      await restoreFileTransactionSnapshot(transaction)
       rollbackSucceeded = true
     } catch (rollbackError) {
-      console.error('[BackgroundTX] 回滚失败，保留 journal 供下次启动继续恢复:', rollbackError)
+      console.error('[FileTX] 回滚失败，保留 journal 供下次启动继续恢复:', rollbackError)
     }
-    if (rollbackSucceeded) {
-      await cleanupBackgroundTransactionFiles(transaction)
-    }
+    if (rollbackSucceeded) await cleanupFileTransactionFiles(transaction)
     throw error
   }
 }
+const getBackgroundTransactionBaseTargets = () => [
+  { path: THEME_FILE, name: 'singbox-themes.json' },
+  ...FEATURES_IMAGE_FORMATS.map((extension) => ({
+    path: `${CUSTOM_BG_PREFIX}${extension}`,
+    name: `custom_bg${extension}`,
+  })),
+]
+const executeBackgroundTransaction = async (mutate, options = {}) =>
+  executeFileTransaction(mutate, {
+    ...options,
+    prefix: BACKGROUND_TX_PREFIX,
+    version: BACKGROUND_TX_VERSION,
+    baseTargets: getBackgroundTransactionBaseTargets(),
+  })
 /*
  * ---------------------------------------------------------
  * 启动恢复
@@ -1314,10 +1497,10 @@ const executeBackgroundTransaction = async (mutate, options = {}) => {
  *              只需要清理残留 backup/journal
  * ---------------------------------------------------------
  */
-const recoverBackgroundTransactions = async () => {
+const recoverFileTransactions = async ({ prefix = BACKGROUND_TX_PREFIX, version = BACKGROUND_TX_VERSION, logTag = 'FileTX' } = {}) => {
   try {
-    const entries = await getDirEntries('data/.cache')
-    const journals = entries.filter((entry) => typeof entry.name === 'string' && entry.name.startsWith(BACKGROUND_TX_PREFIX) && entry.name.endsWith('.json'))
+    const entries = await Plugins.ReadDir('data/.cache')
+    const journals = entries.filter((entry) => typeof entry.name === 'string' && entry.name.startsWith(prefix) && entry.name.endsWith('.json'))
     for (const entry of journals) {
       const journalPath = `data/.cache/${entry.name}`
       try {
@@ -1326,52 +1509,39 @@ const recoverBackgroundTransactions = async () => {
           await safeRemoveFile(journalPath)
           continue
         }
-        const transaction = JSON.parse(raw)
-        if (transaction?.version !== BACKGROUND_TX_VERSION || !transaction?.token || !Array.isArray(transaction.targets)) {
-          console.warn('[BackgroundTX] 忽略未知版本事务:', journalPath)
+        const parsed = JSON.parse(raw)
+        if (parsed?.version !== version || !parsed?.token || !Array.isArray(parsed.targets)) {
+          console.warn(`[${logTag}] 忽略未知版本事务:`, journalPath)
           await safeRemoveFile(journalPath)
           continue
         }
+        const transaction = { ...parsed, prefix: parsed.prefix || prefix, journalPath }
         if (transaction.phase === 'prepared') {
-          console.warn('[BackgroundTX] 发现未完成背景事务，开始回滚:', transaction.token)
+          console.warn(`[${logTag}] 发现未完成事务，开始回滚:`, transaction.token)
           try {
-            await restoreBackgroundSnapshot(transaction)
+            await restoreFileTransactionSnapshot(transaction)
           } catch (rollbackError) {
-            console.error('[BackgroundTX] 启动恢复失败:', rollbackError)
-            /*
-             * 不能在回滚失败后删除 journal，
-             * 留给下一次启动再次尝试。
-             */
+            console.error(`[${logTag}] 启动恢复失败:`, rollbackError)
             continue
           }
         }
-        /*
-         * committed 或 rollback 成功后，
-         * 都可以删除事务文件。
-         */
-        await cleanupBackgroundTransactionFiles(transaction)
+        await cleanupFileTransactionFiles(transaction)
       } catch (error) {
-        console.error('[BackgroundTX] 读取事务日志失败:', journalPath, error)
+        console.error(`[${logTag}] 读取事务日志失败:`, journalPath, error)
       }
     }
-    /*
-     * ------------------------------------------------------
-     * 清理没有 journal 的孤儿 backup。
-     *
-     * 例如：
-     * snapshot 已经开始
-     * 程序马上崩溃
-     * journal 还没成功写入
-     *
-     * 这种情况下无法恢复，但这些 backup 不应该一直残留。
-     * ------------------------------------------------------
-     */
-    await cleanupOrphanBackgroundTransactionFiles()
+    await cleanupOrphanFileTransactionFiles(prefix, logTag)
   } catch (error) {
-    console.error('[BackgroundTX] 启动事务恢复失败:', error)
+    console.error(`[${logTag}] 启动事务恢复失败:`, error)
   }
 }
-const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath = '' }) => {
+const recoverBackgroundTransactions = () =>
+  recoverFileTransactions({
+    prefix: BACKGROUND_TX_PREFIX,
+    version: BACKGROUND_TX_VERSION,
+    logTag: 'BackgroundTX',
+  })
+const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath = '', configPatch = null, targetRelativePath = '', staleRelativePaths = [], updateCustomBackground = true }) => {
   const normalizeExt = (ext) => (ext === '.jpeg' ? '.jpg' : ext)
   const hasBase64 = typeof base64 === 'string' && !!base64
   const hasTempPath = typeof existingTempPath === 'string' && !!existingTempPath
@@ -1411,10 +1581,17 @@ const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath =
   if (expectedSize <= 0 || expectedSize > MAX_IMAGE_SIZE) {
     throw new Error(`图片不能大于 ${MAX_IMAGE_SIZE_MB}MB`)
   }
-  const newRelativePath = `custom_bg${finalExtension}`
+  const fallbackRelativePath = `custom_bg${finalExtension}`
+  const requestedTargetRelativePath = typeof targetRelativePath === 'function' ? targetRelativePath(finalExtension, detected) : targetRelativePath
+  const newRelativePath = requestedTargetRelativePath || fallbackRelativePath
   const newPath = `${PATH}/${newRelativePath}`
+  if (requestedTargetRelativePath && !isValidBackgroundUrlCachePath(newRelativePath)) {
+    throw new Error(`背景缓存路径无效：${newRelativePath}`)
+  }
+  const stalePaths = requestedTargetRelativePath ? [...new Set(staleRelativePaths.filter((path) => typeof path === 'string' && path && path !== newRelativePath))] : FEATURES_IMAGE_FORMATS.map((ext) => `custom_bg${ext}`).filter((path) => path !== newRelativePath)
   const isExternalTemp = !!existingTempPath
   const tempPath = existingTempPath || getTempFilePath('custom-bg')
+  let validatedTempSize = expectedSize
   /*
    * ------------------------------------------------------
    * 阶段 0.5：
@@ -1424,6 +1601,7 @@ const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath =
    * 仍然不碰正式文件。
    * ------------------------------------------------------
    */
+  let savedConfig = null
   try {
     if (!isExternalTemp) {
       await Plugins.WriteFile(tempPath, base64, { Mode: 'Binary' })
@@ -1434,8 +1612,9 @@ const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath =
       if (tempSize !== expectedSize) {
         throw new Error(`临时图片文件写入失败：大小不一致（${tempSize} ≠ ${expectedSize}）`)
       }
+      validatedTempSize = tempSize
     }
-    if (!(await validateStoredBackgroundFile(tempPath))) {
+    if (!(await validateStoredBackgroundFile(tempPath, validatedTempSize))) {
       throw new Error('临时图片文件校验失败')
     }
     /*
@@ -1446,43 +1625,36 @@ const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath =
      * snapshot：
      * - singbox-themes.json
      * - 所有 custom_bg.*
+     * - URL 背景操作额外指定的缓存文件
      * ----------------------------------------------------
      */
-    await executeBackgroundTransaction(async () => {
-      /*
-       * 1. 提交新图片
-       */
-      await atomicMoveFile(tempPath, newPath)
-      /*
-       * 2. 删除旧扩展版本
-       *
-       * 事务 snapshot 已经保存，
-       * 所以这里失败可以恢复。
-       */
-      for (const ext of FEATURES_IMAGE_FORMATS) {
-        const stalePath = `${CUSTOM_BG_PREFIX}${ext}`
-        if (stalePath === newPath) {
-          continue
+    const extraTargets = stalePaths.map((relativePath) => ({
+      path: `${PATH}/${relativePath}`,
+      name: relativePath,
+    }))
+    extraTargets.push({ path: newPath, name: newRelativePath })
+    await executeBackgroundTransaction(
+      async () => {
+        await atomicMoveFile(tempPath, newPath)
+        for (const staleRelativePath of stalePaths) {
+          const stalePath = `${PATH}/${staleRelativePath}`
+          if (await Plugins.FileExists(stalePath)) await removeFileOrThrow(stalePath)
         }
-        await removeFileOrThrow(stalePath)
-      }
-      /*
-       * 3. 最后才修改配置
-       *
-       * 这样正常流程中：
-       * 文件已经存在
-       * ↓
-       * 配置再指向它
-       */
-      const currentConfig = await getCachedConfig()
-      const newConfig = {
-        ...currentConfig,
-        customBackground: isValidCustomBackgroundPath(newRelativePath) ? newRelativePath : '',
-      } // ✅ 直接使用，无需再次归一化
-      await saveConfig(newConfig)
-    })
+        const currentConfig = await getCachedConfig()
+        const patch = isPlainObject(configPatch) ? configPatch : {}
+        const newConfig = {
+          ...currentConfig,
+          ...patch,
+        }
+        if (updateCustomBackground) {
+          newConfig.customBackground = isValidCustomBackgroundPath(newRelativePath) ? newRelativePath : ''
+        }
+        savedConfig = await saveConfig(newConfig)
+      },
+      { extraTargets },
+    )
     return {
-      config: await getCachedConfig(),
+      config: savedConfig,
       relativePath: newRelativePath,
       extension: finalExtension,
       mimeType: detected.mimeType,
@@ -1503,9 +1675,8 @@ const saveImageBinary = async ({ base64 = '', extension = '', existingTempPath =
     }
   }
 }
-const commitBackgroundRemoval = async (newConfig) => {
-  const normalized = newConfig // 直接使用配置
-  return executeBackgroundTransaction(async () => {
+const commitBackgroundRemoval = async (newConfig) =>
+  executeBackgroundTransaction(async () => {
     /*
      * 配置和图片删除必须属于同一个事务。
      *
@@ -1517,10 +1688,9 @@ const commitBackgroundRemoval = async (newConfig) => {
      * 中途任何一步失败，
      * transaction 会恢复完整旧状态。
      */
-    await saveConfig(normalized)
+    await saveConfig(newConfig)
     await removeAllCustomBackgroundsStrict()
   })
-}
 const activeFilePickerCancellers = new Set()
 const openImageFilePicker = () => {
   const input = document.createElement('input')
@@ -1690,6 +1860,13 @@ const SelectImage = async () => {
   const originalState = captureBackgroundState()
   let previewUrl = null
   let previewMutationVersion = null
+  const releasePreviewUrl = () => {
+    if (!previewUrl) return
+    try {
+      URL.revokeObjectURL(previewUrl)
+    } catch {}
+    previewUrl = null
+  }
   try {
     const pickerGeneration = runtimeGeneration
     const file = await openImageFilePicker()
@@ -1716,6 +1893,9 @@ const SelectImage = async () => {
         await saveImageBinary({
           base64,
           extension,
+          configPatch: {
+            backgroundUrlEnabled: false,
+          },
         })
         if (ctx.isActive()) {
           /*
@@ -1733,12 +1913,7 @@ const SelectImage = async () => {
          * 磁盘提交已经完成，但插件运行时已失效。
          * 不再修改 DOM。
          */
-        if (previewUrl) {
-          try {
-            URL.revokeObjectURL(previewUrl)
-          } catch {}
-          previewUrl = null
-        }
+        releasePreviewUrl()
         return true
       },
       {
@@ -1757,33 +1932,18 @@ const SelectImage = async () => {
       if (previewMutationVersion !== null && backgroundMutationVersion === previewMutationVersion) {
         restoreBackgroundState(originalState, previewMutationVersion)
       }
-      if (previewUrl) {
-        try {
-          URL.revokeObjectURL(previewUrl)
-        } catch {}
-        previewUrl = null
-      }
+      releasePreviewUrl()
       return false
     }
     console.error('[CustomTheme] SelectImage 失败:', error)
     if (previewMutationVersion !== null && backgroundMutationVersion === previewMutationVersion) {
       restoreBackgroundState(originalState, previewMutationVersion)
     }
-    if (previewUrl) {
-      try {
-        URL.revokeObjectURL(previewUrl)
-      } catch {}
-      previewUrl = null
-    }
+    releasePreviewUrl()
     Plugins.message.error(errText(error, '保存本地背景失败'))
     return false
   } finally {
-    if (previewUrl) {
-      try {
-        URL.revokeObjectURL(previewUrl)
-      } catch {}
-      previewUrl = null
-    }
+    releasePreviewUrl()
   }
 }
 const isPrivateIPv4 = (ip) => {
@@ -2047,99 +2207,73 @@ const validateImageUrl = (value) => {
   if (isBlockedHost(url.hostname)) throw new Error('不允许访问本机或局域网地址')
   return url.href
 }
-const NETWORK_ERROR_RULES = [
-  [/forcibly closed|connection reset by peer|connection was reset/i, '连接被远端强制中断'],
-  [/no such host|lookup .*?( on |:).*?no such host|server misbehaving/i, '域名解析失败'],
-  [/network is unreachable|no route to host/i, '网络不可达'],
-  [/connection refused/i, '连接被拒绝'],
-  [/i\/o timeout|context deadline exceeded|Client\.Timeout|exceeded while awaiting/i, '请求超时'],
-  [/certificate|x509|tls: /i, 'TLS 证书校验失败'],
-  [/too many redirects|stopped after \d+ redirects/i, '重定向次数过多'],
-]
-const isRetriableNetworkError = (text) => /forcibly closed|connection reset by peer|connection was reset|connection refused|network is unreachable|no route to host/i.test(text)
-const getRequestProxyInfo = async () => {
-  try {
-    if (typeof Plugins.GetRequestProxy !== 'function') return null
-    const proxy = await Plugins.GetRequestProxy()
-    return typeof proxy === 'string' && proxy.trim() ? proxy.trim() : ''
-  } catch {
-    return null
-  }
-}
-const describeNetworkError = async (error) => {
-  const raw = errText(error)
-  for (const [pattern, label] of NETWORK_ERROR_RULES) {
-    if (!pattern.test(raw)) continue
-    const proxy = await getRequestProxyInfo()
-    const proxyHint = proxy === null ? '' : proxy ? `（当前请求代理：${proxy}）` : '（当前请求代理为空，导入会直连）'
-    return `${label}${proxyHint}\n预览走浏览器网络，导入走宿主的「请求代理」，两者可以不一样 —— 请在「设置 → 网络设置 → 请求代理」中确认。`
-  }
-  return raw
-}
 /* 【P0 修复】下载在线图片：每次重试生成新临时文件，防止数据污染 */
+const getResponseHeaderValue = (headers, name) => {
+  if (!headers || typeof headers !== 'object') return ''
+  const key = Object.keys(headers).find((item) => item.toLowerCase() === name.toLowerCase())
+  if (!key) return ''
+  const value = headers[key]
+  if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0].trim() : ''
+  return typeof value === 'string' ? value.trim() : ''
+}
 const downloadOnlineImage = async (url, isCancelled = () => false) => {
+  const MAX_REDIRECTS = 5
+  const headers = { Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' }
+
   const attempt = async () => {
-    // 【关键】每次 attempt 生成全新的 tempPath，避免重试时读写同一个损坏文件
-    const tempPath = getTempFilePath('online_image')
-    if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
+    let currentUrl = validateImageUrl(url)
+    let tempPath = null
     try {
-      // 注意：Plugins.Download 默认不强制跟随重定向，由宿主请求策略控制。
-      // 如果宿主支持禁用重定向 (如 { Redirect: 'manual' })，应加上。
-      // 否则 JS 层无法拦截 302 到内网的 SSRF，只能依赖后端 TUN 或代理规则。
-      const res = await Plugins.Download(url, tempPath, { Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' }, undefined, { Timeout: ONLINE_IMAGE_TIMEOUT_SECONDS })
-      if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
-      const status = res?.status
-      if (typeof status === 'number' && (status < 200 || status >= 300)) {
-        throw new Error(`下载失败：HTTP ${status}`)
+      for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
+        if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
+
+        tempPath = getTempFilePath(`online_image_${redirectCount}`)
+        const res = await Plugins.Download(currentUrl, tempPath, headers, undefined, { Timeout: ONLINE_IMAGE_TIMEOUT_SECONDS, Redirect: false })
+        if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
+
+        const status = res?.status
+        if (typeof status === 'number' && status >= 300 && status < 400) {
+          const location = getResponseHeaderValue(res?.headers, 'location')
+          await safeRemoveFile(tempPath)
+          tempPath = null
+          if (!location) throw new Error(`下载失败：HTTP ${status} 且未提供重定向地址`)
+          const redirectedUrl = validateImageUrl(new URL(location, currentUrl).href)
+          if (redirectCount >= MAX_REDIRECTS) throw new Error('下载失败：重定向次数超过限制')
+          currentUrl = redirectedUrl
+          continue
+        }
+
+        if (typeof status === 'number' && (status < 200 || status >= 300)) {
+          throw new Error(`下载失败：HTTP ${status}`)
+        }
+
+        const physicalSize = await getFileSize(tempPath)
+        if (physicalSize === FILE_SIZE_UNKNOWN) throw new Error('下载失败：临时文件未生成或无法读取')
+        if (physicalSize <= 0) throw new Error('下载内容为空')
+        if (physicalSize > MAX_IMAGE_SIZE) throw new Error(`在线图片不能大于 ${MAX_IMAGE_SIZE_MB}MB`)
+        const detected = detectImageFormat(await readFilePrefix(tempPath, 128))
+        if (!detected) throw new Error('下载内容不是支持的图片格式')
+        return { tempPath, extension: detected.extension, mimeType: detected.mimeType, size: physicalSize, finalUrl: currentUrl }
       }
-      const physicalSize = await getFileSize(tempPath)
-      if (physicalSize === FILE_SIZE_UNKNOWN) throw new Error('下载失败：临时文件未生成或无法读取')
-      if (physicalSize <= 0) throw new Error('下载内容为空')
-      if (physicalSize > MAX_IMAGE_SIZE) throw new Error(`在线图片不能大于 ${MAX_IMAGE_SIZE_MB}MB`)
-      const detected = detectImageFormat(await readFilePrefix(tempPath, 128))
-      if (!detected) throw new Error('下载内容不是支持的图片格式')
-      return { tempPath, extension: detected.extension, mimeType: detected.mimeType, size: physicalSize }
+      throw new Error('下载失败：重定向次数超过限制')
     } catch (error) {
-      await safeRemoveFile(tempPath) // 失败必须清理当前 attempt 的临时文件
+      if (tempPath) await safeRemoveFile(tempPath)
       throw error
     }
   }
+
   let lastError = null
   for (let i = 0; i < 2; i++) {
-    // 最多重试 1 次
     try {
       return await attempt()
     } catch (error) {
       lastError = error
       if (isCancelled() || !isRetriableNetworkError(errText(error))) break
-      console.warn(`[CustomTheme] 连接被重置，重试 ${i + 1}/1:`, errText(error))
-      // 短暂延迟再重试
+      console.warn(`[CustomTheme] 临时网络错误，重试 ${i + 1}/1:`, errText(error))
       await new Promise((r) => setTimeout(r, 500))
     }
   }
   throw lastError || new Error('下载失败')
-}
-const importOnlineImage = async (url, isCancelled = () => false) => {
-  // 阶段 1：下载 (可取消)
-  const data = await downloadOnlineImage(url, isCancelled)
-  if (isCancelled()) {
-    await safeRemoveFile(data.tempPath)
-    return { cancelled: true }
-  }
-  // 阶段 2：落盘 (不可取消，保证原子性)
-  // 一旦进入 saveImageBinary，就忽略取消信号，确保文件系统状态一致
-  try {
-    const result = await saveImageBinary({
-      extension: data.extension,
-      existingTempPath: data.tempPath,
-    })
-    // 落盘成功后只返回结果；DOM 预览由队列调用方在 ctx.isActive() 检查后执行。
-    return { ...result, size: data.size }
-  } catch (error) {
-    // 落盘失败，清理临时文件
-    await safeRemoveFile(data.tempPath)
-    throw error
-  }
 }
 const ensureThemeModalStyle = () => {
   let style = document.getElementById(THEME_MODAL_STYLE_ID)
@@ -2147,7 +2281,10 @@ const ensureThemeModalStyle = () => {
     style = document.createElement('style')
     style.id = THEME_MODAL_STYLE_ID
     document.head.appendChild(style)
+  } else if (style.dataset.customThemeStyleVersion === THEME_MODAL_STYLE_VERSION) {
+    return style
   }
+  style.dataset.customThemeStyleVersion = THEME_MODAL_STYLE_VERSION
   style.textContent = `
     /* =====================================================================
      * CSS 编辑器：宿主 Plugins.modal + CodeEditor
@@ -2175,19 +2312,166 @@ const ensureThemeModalStyle = () => {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
-    .gui-modal-modal-content:has(.ctm-unified-modal-root),
-    .gui-modal-modal-scrollview:has(.ctm-unified-modal-root),
-    .gui-modal-modal-body:has(.ctm-unified-modal-root) {
+    /*
+     * 宿主 Modal 实际结构：
+     * .gui-modal-modal
+     *   ├─ .gui-modal-header
+     *   ├─ .gui-scroll-view
+     *   │    └─ .ctm-unified-modal-root
+     *   └─ .gui-modal-footer（本插件关闭宿主 footer）
+     *
+     * 注意：这里不要使用不存在的 gui-modal-modal-content / scrollview / body。
+     */
+    .gui-modal-modal:has(.ctm-unified-modal-root) {
       min-height: 0 !important;
-      height: 100% !important;
+      overflow: hidden !important;
+    }
+    .gui-modal-modal:has(.ctm-unified-modal-root) > .gui-scroll-view {
+      min-height: 0 !important;
+      flex: 1 1 auto !important;
+      height: auto !important;
       padding: 0 !important;
       overflow: hidden !important;
     }
+
+    .gui-modal-modal:has(.ctm-unified-modal-root) > .gui-scroll-view > .ctm-unified-modal-root {
+      min-height: 0 !important;
+      height: 100% !important;
+      width: 100% !important;
+      flex: 1 1 auto !important;
+      overflow: hidden !important;
+    }
+
+    /* 在线图片：Header / 内容滚动区 / Footer 三段式布局。
+     * Footer 使用宿主 Plugins.modal 的 action slot，位于 gui-scroll-view 外部，
+     * 因此它不会随正文滚动；只有 ctm-online-image-body 自己滚动。
+     */
+    .gui-modal-modal:has(.ctm-online-image-body) {
+      display: flex !important;
+      flex-direction: column !important;
+      min-height: 0 !important;
+      overflow: hidden !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-scroll-view {
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      height: 0 !important;
+      padding: 0 !important;
+      overflow: hidden !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-scroll-view > .ctm-unified-modal-root {
+      width: 100% !important;
+      height: 100% !important;
+      min-height: 0 !important;
+      flex: 1 1 auto !important;
+      display: flex !important;
+      flex-direction: column !important;
+      overflow: hidden !important;
+    }
+    .ctm-online-image-body {
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      height: 0 !important;
+      max-height: none !important;
+      overflow-y: auto !important;
+      overflow-x: hidden !important;
+      box-sizing: border-box !important;
+    }
+    /* 在线图片：只将滚动条滑块视觉上向左内缩，不改变滚动容器布局。 */
+    .ctm-online-image-body::-webkit-scrollbar {
+      width: 12px;
+    }
+    .ctm-online-image-body::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .ctm-online-image-body::-webkit-scrollbar-thumb {
+      background: var(--ct-scroll-thumb);
+      border-left: 2px solid transparent;
+      border-right: 6px solid transparent;
+      background-clip: padding-box;
+      border-radius: 999px;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer {
+      flex: 0 0 auto !important;
+      min-height: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      border-top: 1px solid var(--divider-color) !important;
+      background: transparent !important;
+      background-color: transparent !important;
+      background-image: none !important;
+      box-sizing: border-box !important;
+      overflow: hidden !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer {
+      position: static !important;
+      inset: auto !important;
+      z-index: auto !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: flex-end !important;
+      gap: 8px !important;
+      width: 100% !important;
+      min-height: 0 !important;
+      margin: 0 !important;
+      padding: 7px 16px !important;
+      box-sizing: border-box !important;
+      background: transparent !important;
+      background-color: transparent !important;
+      background-image: none !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+      border: 0 !important;
+      opacity: 1 !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer .ctm-button {
+      flex: 0 0 auto !important;
+      min-width: 88px !important;
+      height: 36px !important;
+      padding: 0 15px !important;
+      box-sizing: border-box !important;
+      border: 1px solid var(--ct-border) !important;
+      border-radius: 8px !important;
+      color: var(--ct-button-color) !important;
+      background: var(--ct-button-bg) !important;
+      background-color: var(--ct-button-bg) !important;
+      font-size: 13px !important;
+      font-family: inherit !important;
+      opacity: 1 !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer .ctm-button:hover:not(:disabled) {
+      background: var(--ct-button-hover-bg) !important;
+      background-color: var(--ct-button-hover-bg) !important;
+      border-color: var(--ct-button-hover-border) !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer .ctm-button.primary {
+      color: var(--ct-primary-color) !important;
+      background: var(--ct-primary-bg) !important;
+      background-color: var(--ct-primary-bg) !important;
+      border-color: var(--ct-primary-bg) !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer .ctm-button.primary:hover:not(:disabled) {
+      background: var(--ct-primary-hover-bg) !important;
+      background-color: var(--ct-primary-hover-bg) !important;
+      border-color: var(--ct-primary-hover-bg) !important;
+    }
+    .gui-modal-modal:has(.ctm-online-image-body) > .gui-modal-footer .ctm-online-image-footer .ctm-button:disabled {
+      opacity: .45 !important;
+      cursor: default !important;
+    }
+
     .ctm-unified-modal-root .ctm-unified-modal-body {
       min-width: 0;
       min-height: 0;
       width: 100%;
       box-sizing: border-box;
+    }
+    .ctm-unified-modal-root .ctm-unified-modal-body.ctm-background-picker-content {
+      height: 100%;
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden !important;
     }
     .ctm-unified-modal-title {
       min-width: 0;
@@ -2275,6 +2559,22 @@ const ensureThemeModalStyle = () => {
       flex: 1 1 auto;
       min-width: 8px;
     }
+    .ctm-css-plugin-css-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 13px;
+      color: var(--ct-color-primary);
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .ctm-css-plugin-css-toggle input {
+      width: 15px;
+      height: 15px;
+      margin: 0;
+    }
+
 
     /* CodeEditor + 实时诊断 + 底部操作区：必须明确 flex 高度，避免底部按钮被编辑器挤出可视区域。 */
     .ctm-css-plugin-editor {
@@ -2486,44 +2786,7 @@ const ensureThemeModalStyle = () => {
       --ct-overlay: var(--modal-mask-bg-dark, var(--modal-mask-bg, rgba(0,0,0,.42)));
     }
 
-    [data-custom-theme-modal-mask] { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; background: var(--ct-overlay); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
-    [data-custom-theme-modal-mask].ctm-modal-mask-minimized { background: transparent !important; backdrop-filter: none !important; -webkit-backdrop-filter: none !important; pointer-events: none; }
-    [data-custom-theme-modal-mask].ctm-modal-mask-minimized [data-custom-theme-modal] { pointer-events: auto; }
-    [data-ctm-preview-bar] { position: fixed; z-index: 2147483001; right: 24px; bottom: 24px; display: none; align-items: center; gap: 10px; padding: 10px 12px; box-sizing: border-box; color: #000000; background: color-mix(in srgb, var(--ct-surface-elevated) 78%, transparent); backdrop-filter: none; -webkit-backdrop-filter: none; border: 1px solid rgba(255,255,255,.22); border-radius: 12px; box-shadow: 0 14px 38px rgba(0,0,0,.34); font-size: 13px; font-family: inherit; user-select: none; -webkit-user-select: none; transition: box-shadow .15s ease, border-color .15s ease; }
-    [data-ctm-preview-bar].ctm-visible { display: inline-flex; }
-    [data-ctm-preview-bar].is-dragging { border-color: rgba(96,165,250,.72); box-shadow: 0 18px 46px rgba(0,0,0,.38), 0 0 0 1px rgba(96,165,250,.18); }
-    [data-ctm-preview-bar] .ctm-preview-bar-label { display: inline-flex; align-items: center; gap: 7px; color: #000000; white-space: nowrap; cursor: grab; font-weight: 600; user-select: none; -webkit-user-select: none; touch-action: none; }
-    [data-ctm-preview-bar].is-dragging .ctm-preview-bar-label { cursor: grabbing; }
-    [data-ctm-preview-bar] .ctm-preview-bar-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,.14); }
-    [data-ctm-preview-bar] .ctm-preview-bar-btn { height: 30px; padding: 0 12px; box-sizing: border-box; border: 1px solid rgba(255,255,255,.18); border-radius: 8px; color: #e5e7eb; background: rgba(255,255,255,.08); font-size: 13px; font-family: inherit; cursor: pointer; white-space: nowrap; transition: background .15s ease, border-color .15s ease, color .15s ease; }
-    [data-ctm-preview-bar] .ctm-preview-bar-btn:hover { background: rgba(0,0,0,.06); border-color: rgba(0,0,0,.24); color: #000000; }
-    [data-ctm-preview-bar] .ctm-preview-bar-btn.ctm-active { color: #000000; background: rgba(0,0,0,.08); border-color: rgba(0,0,0,.24); }
-    [data-ctm-preview-bar] .ctm-preview-bar-btn.ctm-active:hover { background: rgba(0,0,0,.12); }
     [data-custom-theme-modal] { display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; position: relative; min-width: 320px; min-height: 180px; color: var(--ct-color-primary); background: rgba(128,128,128,.45); background: color-mix(in srgb, var(--ct-surface-elevated) 65%, transparent); backdrop-filter: blur(18px) saturate(1.6); -webkit-backdrop-filter: blur(18px) saturate(1.6); border: 1px solid var(--ct-border); box-shadow: 0 24px 70px rgba(0,0,0,.28); border-radius: 12px; transition: background-color .2s ease, color .2s ease, border-color .2s ease, box-shadow .2s ease; }
-    [data-custom-theme-modal].ctm-modal-minimized { min-width: 320px; min-height: 0; height: auto !important; max-height: none !important; }
-    [data-custom-theme-modal].ctm-modal-minimized > :not(.ctm-header) { display: none !important; }
-    [data-custom-theme-modal] .ctm-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 12px 14px 18px; border-bottom: 1px solid var(--ct-border); flex-shrink: 0; cursor: move; user-select: none; touch-action: none; }
-    [data-custom-theme-modal].ctm-modal-minimized .ctm-header { border-bottom: 0; }
-    [data-custom-theme-modal] .ctm-title { min-width: 0; flex: 1 1 auto; color: var(--ct-color-primary); font-size: 16px; font-weight: 600; line-height: 1.35; }
-    [data-custom-theme-modal] .ctm-subtitle { margin-top: 4px; color: var(--ct-color-secondary); font-size: 12px; opacity: .68; }
-    [data-custom-theme-modal] .ctm-window-controls { display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; }
-    [data-custom-theme-modal] .ctm-window-control { width: 30px; height: 30px; flex: 0 0 30px; padding: 0; border: 1px solid transparent; border-radius: 8px; color: var(--ct-button-color); background: transparent; font-size: 16px; line-height: 1; cursor: pointer; opacity: .68; transition: background .15s ease, opacity .15s ease, border-color .15s ease; }
-    [data-custom-theme-modal] .ctm-window-control:hover { opacity: 1; background: var(--ct-button-bg); border-color: var(--ct-border); }
-    [data-custom-theme-modal] .ctm-window-control.ctm-window-close:hover { background: color-mix(in srgb, #ef4444 18%, var(--ct-button-bg)); border-color: color-mix(in srgb, #ef4444 40%, var(--ct-border)); }
-    [data-custom-theme-modal] .ctm-window-close { font-size: 20px; }
-    [data-custom-theme-modal] .ctm-resize-handle { position: absolute; z-index: 20; pointer-events: auto; touch-action: none; user-select: none; }
-    [data-custom-theme-modal] .ctm-resize-n { top: 0; left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
-    [data-custom-theme-modal] .ctm-resize-s { bottom: 0; left: 10px; right: 10px; height: 8px; cursor: ns-resize; }
-    [data-custom-theme-modal] .ctm-resize-e { top: 10px; right: 0; bottom: 10px; width: 8px; cursor: ew-resize; }
-    [data-custom-theme-modal] .ctm-resize-w { top: 10px; left: 0; bottom: 10px; width: 8px; cursor: ew-resize; }
-    [data-custom-theme-modal] .ctm-resize-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: nesw-resize; }
-    [data-custom-theme-modal] .ctm-resize-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nwse-resize; }
-    [data-custom-theme-modal] .ctm-resize-se { right: 0; bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
-    [data-custom-theme-modal] .ctm-resize-sw { left: 0; bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; }
-    [data-custom-theme-modal].ctm-modal-maximized .ctm-resize-handle,
-    [data-custom-theme-modal].ctm-modal-minimized .ctm-resize-handle { display: none; }
-    [data-custom-theme-modal] .ctm-close { width: 30px; height: 30px; flex: 0 0 30px; padding: 0; border: 1px solid transparent; border-radius: 8px; color: var(--ct-button-color); background: transparent; font-size: 20px; line-height: 1; cursor: pointer; opacity: .68; transition: background .15s ease, opacity .15s ease, border-color .15s ease; }
-    [data-custom-theme-modal] .ctm-close:hover { opacity: 1; background: var(--ct-button-bg); border-color: var(--ct-border); }
     [data-custom-theme-modal] .ctm-button { min-width: 88px; height: 36px; padding: 0 15px; box-sizing: border-box; border: 1px solid var(--ct-border); border-radius: 8px; color: var(--ct-button-color); background: var(--ct-button-bg); font-size: 13px; cursor: pointer; transition: background .15s ease, border-color .15s ease, transform .15s ease; }
     [data-custom-theme-modal] .ctm-button:hover { background: var(--ct-button-hover-bg); border-color: var(--ct-button-hover-border); }
     [data-custom-theme-modal] .ctm-button:active { transform: translateY(1px); }
@@ -2533,60 +2796,170 @@ const ensureThemeModalStyle = () => {
     [data-custom-theme-modal] .ctm-input { width: 100%; height: 40px; box-sizing: border-box; padding: 0 12px; outline: none; border: 1px solid var(--ct-border); border-radius: 8px; color: var(--ct-color-primary); background: color-mix(in srgb, var(--ct-surface-input) 60%, transparent); font-size: 13px; transition: border-color .15s ease, box-shadow .15s ease, background-color .2s ease; }
     [data-custom-theme-modal] .ctm-input::placeholder { color: var(--ct-color-secondary); opacity: .48; }
     [data-custom-theme-modal] .ctm-input:focus { border-color: var(--ct-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ct-accent) 18%, transparent); }
-    [data-custom-theme-modal] .ctm-textarea { width: 100%; height: 100%; display: block; box-sizing: border-box; margin: 0; padding: 14px 16px; resize: none; outline: none; border: 0; color: var(--ct-color-primary); background: transparent; font-family: Consolas, "Cascadia Code", "JetBrains Mono", monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow: auto; tab-size: 2; transition: background-color .2s ease; }
-    [data-custom-theme-modal] .ctm-textarea::selection { background: color-mix(in srgb, var(--ct-accent) 28%, transparent); }
-    [data-custom-theme-modal] .ctm-textarea::-webkit-scrollbar { width: 10px; height: 10px; }
-    [data-custom-theme-modal] .ctm-textarea::-webkit-scrollbar-track { background: var(--ct-scroll-track); }
-    [data-custom-theme-modal] .ctm-textarea::-webkit-scrollbar-thumb { background: var(--ct-scroll-thumb); border-radius: 10px; }
     [data-custom-theme-modal] .ctm-label { margin-bottom: 7px; color: var(--ct-color-primary); font-size: 12px; font-weight: 500; opacity: .82; }
     [data-custom-theme-modal] .ctm-hint { color: var(--ct-color-secondary); font-size: 11px; line-height: 1.5; opacity: .62; }
     [data-custom-theme-modal] .ctm-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; flex-shrink: 0; }
-    [data-custom-theme-modal] .ctm-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-shrink: 0; }
 
-    /* 自定义 CSS 工作区：标题栏 → 菜单栏 → 编辑器 → 状态栏 */
-    [data-custom-theme-modal] .ctm-css-content { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-    [data-custom-theme-modal] .ctm-css-toolbar { position: relative; min-height: 44px; margin: 0; padding: 0 14px; box-sizing: border-box; border-bottom: 1px solid var(--ct-border); background: color-mix(in srgb, var(--ct-surface-input) 22%, transparent); }
-    [data-custom-theme-modal] .ctm-css-menu-bar { width: 100%; min-height: 44px; display: flex; align-items: center; gap: 2px; box-sizing: border-box; }
-    [data-custom-theme-modal] .ctm-css-menu-wrap { position: relative; display: inline-flex; align-items: center; height: 100%; }
-    [data-custom-theme-modal] .ctm-css-menu-trigger { height: 32px; padding: 0 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--ct-color-primary); font: inherit; font-size: 13px; line-height: 1; cursor: pointer; opacity: .88; transition: background .15s ease, border-color .15s ease, opacity .15s ease; }
-    [data-custom-theme-modal] .ctm-css-menu-trigger:hover,
-    [data-custom-theme-modal] .ctm-css-menu-trigger[aria-expanded="true"] { opacity: 1; background: var(--ct-button-bg); border-color: var(--ct-border); }
-    [data-custom-theme-modal] .ctm-css-menu-trigger:active { transform: translateY(1px); }
-        [data-custom-theme-modal] .ctm-css-menu-trigger:disabled { opacity: .42; cursor: default; background: transparent; border-color: transparent; transform: none; }
-    [data-custom-theme-modal] .ctm-css-menu-trigger.ctm-clear-armed { color: #ef4444; opacity: 1; border-color: color-mix(in srgb, #ef4444 40%, var(--ct-border)); background: color-mix(in srgb, #ef4444 12%, transparent); }
-    [data-custom-theme-modal] .ctm-css-menu-panel { position: absolute; top: calc(100% - 2px); left: 0; z-index: 80; min-width: 148px; padding: 6px; box-sizing: border-box; border: 1px solid var(--ct-border); border-radius: 8px; background: color-mix(in srgb, var(--ct-surface-elevated) 90%, transparent); backdrop-filter: blur(14px) saturate(1.35); -webkit-backdrop-filter: blur(14px) saturate(1.35); box-shadow: 0 16px 36px rgba(0,0,0,.20); display: none; }
-    [data-custom-theme-modal] .ctm-css-menu-wrap.open > .ctm-css-menu-panel { display: flex; flex-direction: column; gap: 2px; }
-    [data-custom-theme-modal] .ctm-css-menu-item { width: 100%; min-width: 0; height: 32px; padding: 0 10px; box-sizing: border-box; display: flex; align-items: center; justify-content: flex-start; border: 1px solid transparent; border-radius: 6px; color: var(--ct-button-color); background: transparent; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
-    [data-custom-theme-modal] .ctm-css-menu-item:hover { background: var(--ct-button-hover-bg); border-color: var(--ct-button-hover-border); }
-    [data-custom-theme-modal] .ctm-css-menu-item:disabled { opacity: .45; cursor: default; }
-    [data-custom-theme-modal] .ctm-css-menu-item.primary { color: var(--ct-primary-color); background: var(--ct-primary-bg); border-color: var(--ct-primary-bg); }
-    [data-custom-theme-modal] .ctm-css-menu-item.primary:hover { background: var(--ct-primary-hover-bg); border-color: var(--ct-primary-hover-bg); }
-    [data-custom-theme-modal] .ctm-css-menu-spacer { flex: 1 1 auto; min-width: 12px; }
-        [data-custom-theme-modal] .ctm-css-bell { position: relative; height: 32px; padding: 0 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--ct-color-secondary); font: inherit; font-size: 15px; line-height: 1; cursor: pointer; opacity: .5; transition: background .15s ease, opacity .15s ease, color .15s ease; }
-    [data-custom-theme-modal] .ctm-css-bell:hover { background: var(--ct-button-bg); opacity: 1; }
-    [data-custom-theme-modal] .ctm-css-bell.has-warnings { color: #f59e0b; opacity: 1; }
-    [data-custom-theme-modal] .ctm-css-bell-badge { position: absolute; top: 1px; right: 2px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 8px; background: #f59e0b; color: #fff; font-size: 10px; line-height: 15px; text-align: center; font-weight: 600; pointer-events: none; }
-    [data-custom-theme-modal] .ctm-css-editor-shell { position: relative; min-height: 0; flex: 1 1 auto; display: flex; overflow: hidden; border-bottom: 1px solid var(--ct-border); background: color-mix(in srgb, var(--ct-surface-input) 28%, transparent); }
-    [data-custom-theme-modal] .ctm-css-gutter { flex: 0 0 52px; width: 52px; min-width: 52px; box-sizing: border-box; overflow: hidden; padding: 14px 10px 14px 0; border-right: 1px solid var(--ct-border); color: var(--ct-color-secondary); background: color-mix(in srgb, var(--ct-surface-input) 45%, transparent); font-family: Consolas, "Cascadia Code", "JetBrains Mono", monospace; font-size: 13px; line-height: 1.65; text-align: right; user-select: none; }
-    [data-custom-theme-modal] .ctm-css-line-numbers { min-height: 100%; white-space: pre; opacity: .62; }
-    [data-custom-theme-modal] .ctm-css-editor-shell .ctm-textarea { flex: 1 1 auto; min-width: 0; height: 100%; background: transparent; border-radius: 0; }
-    [data-custom-theme-modal] .ctm-css-hint { display: none; }
-    [data-custom-theme-modal] .ctm-css-footer { min-height: 52px; margin: 0; padding: 8px 14px; box-sizing: border-box; align-items: center; justify-content: flex-start; gap: 10px; border-top: 0; background: color-mix(in srgb, var(--ct-surface-input) 16%, transparent); }
-    [data-custom-theme-modal] .ctm-css-footer .ctm-status { margin-left: 4px; white-space: nowrap; }
-    [data-custom-theme-modal] .ctm-css-footer-actions { margin-left: auto; display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex: 0 0 auto; }
-    [data-custom-theme-modal] .ctm-css-footer-actions .ctm-button { min-width: 96px; }
-    [data-custom-theme-modal] .ctm-warning-box { display: none; position: absolute; right: 12px; top: 8px; z-index: 20; width: clamp(240px, 40%, 520px); max-height: 200px; overflow: hidden; margin: 0; padding: 0; border: 1px solid color-mix(in srgb, #f59e0b 32%, var(--ct-border)); border-radius: 8px; background: color-mix(in srgb, var(--ct-surface-elevated) 96%, #f59e0b 4%); color: var(--ct-color-primary); font-size: 11px; line-height: 1.4; box-shadow: 0 8px 22px rgba(0,0,0,.18); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
-    [data-custom-theme-modal] .ctm-warning-box.visible { display: flex; flex-direction: column; }
-    [data-custom-theme-modal] .ctm-warning-header { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, #f59e0b 22%, var(--ct-border)); }
-    [data-custom-theme-modal] .ctm-warning-title { flex: 1 1 auto; font-weight: 600; font-size: 11px; line-height: 15px; }
-    [data-custom-theme-modal] .ctm-warning-btn { flex: 0 0 auto; height: 20px; padding: 0 8px; border: 1px solid color-mix(in srgb, #f59e0b 35%, var(--ct-border)); border-radius: 5px; background: transparent; color: var(--ct-color-secondary); font: inherit; font-size: 11px; line-height: 1; cursor: pointer; opacity: .92; transition: background .15s ease, opacity .15s ease; }
-    [data-custom-theme-modal] .ctm-warning-btn:hover { background: color-mix(in srgb, #f59e0b 14%, transparent); opacity: 1; }
-    [data-custom-theme-modal] .ctm-warning-items { flex: 1 1 auto; overflow: auto; padding: 6px 8px; user-select: text; -webkit-user-select: text; cursor: text; }
-    [data-custom-theme-modal] .ctm-warning-item { margin-left: 10px; white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word; }
     [data-custom-theme-modal] .ctm-preview { display: flex; align-items: center; justify-content: center; overflow: hidden; border: 1px solid var(--ct-border); border-radius: 10px; background: color-mix(in srgb, var(--ct-surface-input) 40%, transparent); transition: background-color .2s ease; }
     [data-custom-theme-modal] .ctm-preview img { max-width: 100%; max-height: 100%; display: none; object-fit: contain; }
     [data-custom-theme-modal] .ctm-preview-text { color: var(--ct-color-secondary); font-size: 13px; opacity: .55; }
+
+    /* 预设背景选择器：紧凑网格，不产生内部滚动，底部操作区始终可见。 */
+    [data-custom-theme-modal] .ctm-background-picker-body {
+      display: flex;
+      flex: 1 1 auto;
+      flex-direction: column;
+      min-height: 0;
+      height: 100%;
+      padding: 2px 12px 0;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+    [data-custom-theme-modal] .ctm-background-picker-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 2px 7px;
+      flex: 0 0 auto;
+    }
+    [data-custom-theme-modal] .ctm-background-picker-caption {
+      min-width: 0;
+      color: var(--ct-color-secondary);
+      font-size: 11px;
+      line-height: 1.3;
+    }
+    [data-custom-theme-modal] .ctm-background-picker-count {
+      flex: 0 0 auto;
+      min-width: 26px;
+      height: 20px;
+      padding: 0 7px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+      border: 1px solid var(--ct-border);
+      border-radius: 999px;
+      color: var(--ct-color-secondary);
+      background: color-mix(in srgb, var(--ct-surface-input) 42%, transparent);
+      font-size: 10px;
+      font-weight: 600;
+    }
+    [data-custom-theme-modal] .ctm-background-picker-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 7px;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden !important;
+      padding: 1px 1px 3px;
+      box-sizing: border-box;
+      align-content: start;
+    }
+    [data-custom-theme-modal] .ctm-background-card {
+      min-width: 0;
+      min-height: 0;
+      padding: 4px;
+      border: 1px solid var(--ct-border);
+      border-radius: 8px;
+      box-sizing: border-box;
+      background: color-mix(in srgb, var(--ct-surface-input) 26%, transparent);
+      cursor: pointer;
+      text-align: left;
+      outline: none;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease, box-shadow .15s ease;
+    }
+    [data-custom-theme-modal] .ctm-background-card:hover {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--ct-accent) 42%, var(--ct-border));
+      background: color-mix(in srgb, var(--ct-accent) 6%, var(--ct-surface-input));
+      box-shadow: 0 5px 12px rgba(0,0,0,.10);
+    }
+    [data-custom-theme-modal] .ctm-background-card.is-selected {
+      border-color: var(--ct-accent);
+      background: color-mix(in srgb, var(--ct-accent) 10%, var(--ct-surface-input));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--ct-accent) 18%, transparent);
+    }
+    [data-custom-theme-modal] .ctm-background-card:focus-visible {
+      border-color: var(--ct-accent);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--ct-accent) 24%, transparent);
+    }
+    [data-custom-theme-modal] .ctm-background-swatch {
+      position: relative;
+      width: 100%;
+      height: 46px;
+      overflow: hidden;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,.18);
+      box-sizing: border-box;
+      background-color: transparent;
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: cover;
+    }
+    [data-custom-theme-modal] .ctm-background-swatch.is-transparent {
+      background-image:
+        linear-gradient(45deg, rgba(127,127,127,.20) 25%, transparent 25%),
+        linear-gradient(-45deg, rgba(127,127,127,.20) 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, rgba(127,127,127,.20) 75%),
+        linear-gradient(-45deg, transparent 75%, rgba(127,127,127,.20) 75%);
+      background-size: 12px 12px;
+      background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+    }
+    [data-custom-theme-modal] .ctm-background-swatch-label {
+      position: absolute;
+      inset: auto 4px 4px auto;
+      max-width: calc(100% - 8px);
+      padding: 2px 5px;
+      box-sizing: border-box;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      border-radius: 4px;
+      color: #fff;
+      background: rgba(0,0,0,.34);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
+      font-size: 9px;
+      line-height: 1.15;
+    }
+    [data-custom-theme-modal] .ctm-background-card-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+      margin-top: 4px;
+      padding: 0 1px 1px;
+      color: var(--ct-color-secondary);
+      font-size: 9px;
+      line-height: 1.15;
+    }
+    [data-custom-theme-modal] .ctm-background-card-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--ct-color-primary);
+      font-weight: 600;
+    }
+    [data-custom-theme-modal] .ctm-background-card-value {
+      flex: 0 0 auto;
+      opacity: .58;
+      font-family: Consolas, "Cascadia Code", "JetBrains Mono", monospace;
+    }
+    @media (max-width: 700px) {
+      [data-custom-theme-modal] .ctm-background-picker-grid {
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 6px;
+      }
+    }
+    @media (max-width: 560px) {
+      [data-custom-theme-modal] .ctm-background-picker-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+    }
   `
+  return style
 }
 const $el = (tag, className, text, style) => {
   const element = document.createElement(tag)
@@ -2667,7 +3040,7 @@ const createButton = (text, primary = false) => {
  * 这里仅统一“外壳”，不修改 CSS 编辑器 CodeMirror 6 组件内部逻辑。
  */
 const activeUnifiedModals = new Set()
-const createUnifiedDomContent = (body, name = 'CustomThemeDomModalContent') =>
+const createUnifiedSlotContent = (node, { name = 'CustomThemeDomModalContent', className = 'ctm-unified-modal-root', customTheme = true, mountError = '挂载 Modal 内容失败' } = {}) =>
   Vue.defineComponent({
     name,
     setup() {
@@ -2675,24 +3048,21 @@ const createUnifiedDomContent = (body, name = 'CustomThemeDomModalContent') =>
       Vue.onMounted(() => {
         if (!host.value) return
         try {
-          host.value.appendChild(body)
+          host.value.appendChild(node)
         } catch (error) {
-          console.error('[CustomTheme] 挂载 Modal 内容失败:', error)
+          console.error(`[CustomTheme] ${mountError}:`, error)
         }
       })
       Vue.onUnmounted(() => {
         try {
-          body.remove()
+          node.remove()
         } catch {}
       })
-      return () =>
-        Vue.h('div', {
-          ref: host,
-          class: 'ctm-unified-modal-root',
-          'data-custom-theme-modal': '',
-        })
+      return () => Vue.h('div', { ref: host, class: className, ...(customTheme ? { 'data-custom-theme-modal': '' } : {}) })
     },
   })
+
+const createUnifiedDomContent = (body, name = 'CustomThemeDomModalContent') => createUnifiedSlotContent(body, { name })
 
 const createUnifiedModalTitle =
   (title, subtitle = '') =>
@@ -2726,202 +3096,725 @@ const destroyUnifiedModals = () => {
   activeUnifiedModals.clear()
 }
 
-const OnlineImage = () => {
-  let closed = false
-  let validateTimer = null
-  let previewVersion = 0
-  let importQueued = false
-
-  const previewImage = $el('img')
-  previewImage.alt = '图片预览'
-  previewImage.referrerPolicy = 'no-referrer'
-
-  const stopPreview = () => {
-    previewImage.onload = null
-    previewImage.onerror = null
+const createOnlineImagePreviewController = ({ state, urlInput, previewImage, previewText, info }) => {
+  const release = () => {
+    if (!state.previewObjectUrl) return
     try {
-      previewImage.removeAttribute('src')
+      URL.revokeObjectURL(state.previewObjectUrl)
     } catch {}
+    state.previewObjectUrl = null
   }
 
-  const content = $el('div', 'ctm-unified-modal-body', '', 'padding:18px 20px 20px; overflow:auto;')
-  content.appendChild($el('div', 'ctm-label', '图片 URL'))
-  const input = $el('input', 'ctm-input')
-  input.type = 'url'
-  input.placeholder = 'https://example.com/image.webp'
-  input.autocomplete = 'off'
-  input.spellcheck = false
-  content.appendChild(input)
-
-  const preview = $el('div', 'ctm-preview', '', 'height:225px; margin-top:13px;')
-  const previewText = $el('div', 'ctm-preview-text', '输入 URL 后预览图片')
-  preview.appendChild(previewImage)
-  preview.appendChild(previewText)
-  content.appendChild(preview)
-
-  const info = $el('div', 'ctm-hint', '', 'min-height:20px; margin-top:9px; white-space: pre-line;')
-  content.appendChild(info)
-
-  const footer = $el('div', 'ctm-footer')
-  const cancel = createButton('取消')
-  const importButton = createButton('导入图片', true)
-  footer.appendChild(cancel)
-  footer.appendChild(importButton)
-  content.appendChild(footer)
-
-  const stopAndCleanup = () => {
-    clearTimeout(validateTimer)
-    validateTimer = null
-    previewVersion++
-    stopPreview()
-    try {
-      content.remove()
-    } catch {}
-  }
-
-  let modal = null
-  const close = () => {
-    if (closed) return
-    closed = true
-    try {
-      modal?.close?.()
-    } catch {
-      stopAndCleanup()
-      try {
-        modal?.destroy?.()
-      } catch {}
-    }
-  }
-
-  const showPreviewText = (text) => {
+  const update = () => {
+    const rawUrl = urlInput.value.trim()
+    const version = ++state.previewVersion
+    release()
     previewImage.style.display = 'none'
     previewText.style.display = ''
-    previewText.textContent = text
-  }
+    if (!rawUrl) {
+      previewText.textContent = '输入 URL 后预览图片'
+      return
+    }
 
-  const updatePreview = () => {
-    const url = input.value.trim()
-    const version = ++previewVersion
-    info.textContent = ''
-    if (!url) {
-      stopPreview()
-      showPreviewText('输入 URL 后预览图片')
-      return
-    }
+    /*
+     * 预览可以继续使用浏览器加载，
+     * 但这里不把“预览成功”当成“允许入库”的条件。
+     */
+    let previewUrl = ''
     try {
-      validateImageUrl(url)
+      previewUrl = validateImageUrl(rawUrl)
     } catch (error) {
-      stopPreview()
-      showPreviewText(errText(error))
+      previewText.textContent = errText(error, '图片 URL 不允许预览')
+      info.textContent = ''
       return
     }
-    showPreviewText('正在加载预览...')
+
+    previewText.textContent = '正在加载预览...'
     previewImage.onload = () => {
-      if (closed || version !== previewVersion) return
+      if (state.closed || version !== state.previewVersion) return
       previewImage.style.display = 'block'
       previewText.style.display = 'none'
       info.textContent = `${previewImage.naturalWidth} × ${previewImage.naturalHeight}`
     }
     previewImage.onerror = () => {
-      if (closed || version !== previewVersion) return
-      showPreviewText('无法加载此图片')
+      if (state.closed || version !== state.previewVersion) return
+      previewText.style.display = ''
+      previewImage.style.display = 'none'
+      previewText.textContent = '无法加载预览（仍可直接加入 URL 背景库）'
       info.textContent = ''
     }
-    previewImage.src = url
+    previewImage.src = previewUrl
   }
 
-  input.oninput = () => {
-    clearTimeout(validateTimer)
-    validateTimer = setTimeout(updatePreview, 350)
-  }
+  return { release, update }
+}
 
-  importButton.onclick = () => {
-    if (importQueued) return
-    const rawUrl = input.value.trim()
-    try {
-      validateImageUrl(rawUrl)
-    } catch (error) {
-      info.textContent = errText(error)
-      return
-    }
-    importQueued = true
-    importButton.disabled = true
-    cancel.disabled = true
-    input.disabled = true
-    importButton.textContent = '正在排队...'
-    info.textContent = '正在等待主题操作队列...'
-    const operation = enqueueThemeOperation(
-      async (ctx) => {
-        if (closed) throw createCancelledError()
-        ctx.assertActive()
-        const url = validateImageUrl(rawUrl)
-        importButton.textContent = '正在导入...'
-        info.textContent = '正在下载图片...'
-        const result = await importOnlineImage(url, () => !ctx.isActive())
-        if (result?.cancelled) return false
-        info.textContent = '图片下载完成，正在应用背景...'
-        if (!ctx.isActive() || closed) return true
-        await applyThemeInternal(ctx)
-        info.textContent = '正在完成导入...'
-        close()
-        const sizeKB = result.size / 1024
-        Plugins.message.success(`在线图片已导入 · ${result.extension} · ${sizeKB.toFixed(2)} KB`, 2200)
-        return true
-      },
-      { label: 'online-image-import' },
-    )
-    operation.catch(async (error) => {
-      const text = errText(error)
-      if (text === 'OPERATION_CANCELLED' || text === 'ONLINE_IMPORT_CANCELLED') return
-      if (closed) return
-      importQueued = false
-      importButton.disabled = false
-      cancel.disabled = false
-      input.disabled = false
-      importButton.textContent = '导入图片'
-      const message = await describeNetworkError(error)
-      info.textContent = message
-      Plugins.message.error(message)
+const runOnlineImageOperation = async ({ state, dom = {}, syncPrimaryButton, label, saving = false, disableAdd = false, disableClose = false }, operation) => {
+  if (state.queued) return null
+  state.queued = true
+  if (saving) state.saving = true
+  if (disableAdd && dom.addButton) dom.addButton.disabled = true
+  if (disableClose && dom.closeButton) dom.closeButton.disabled = true
+  syncPrimaryButton?.()
+  try {
+    return await enqueueThemeOperation(operation, { label })
+  } finally {
+    state.queued = false
+    if (saving) state.saving = false
+    if (disableAdd && dom.addButton) dom.addButton.disabled = false
+    if (disableClose && dom.closeButton) dom.closeButton.disabled = false
+    syncPrimaryButton?.()
+  }
+}
+
+const createOnlineImageLibraryController = ({ state, dom, handlers }) => {
+  const { list, listTitle, librarySummary, libraryBadge } = dom
+
+  const clearDragStyles = () => {
+    list.querySelectorAll('[data-ctm-url-row]').forEach((node) => {
+      node.style.transform = ''
+      node.style.borderColor = 'var(--ct-border)'
+      node.style.background = 'color-mix(in srgb, var(--ct-surface-elevated) 56%, transparent)'
+      node.style.boxShadow = ''
     })
   }
 
-  cancel.onclick = () => close()
+  const persistOrder = async (orderedEntries) =>
+    runOnlineImageOperation({ state, label: 'reorder-url-background' }, async (ctx) => {
+      ctx.assertActive()
+      const latest = await getCachedConfig()
+      const orderMap = new Map(orderedEntries.map((item, index) => [item.id, index]))
+      const next = [...latest.backgroundUrls].sort((a, b) => (orderMap.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (orderMap.get(b.id) ?? Number.MAX_SAFE_INTEGER))
+      state.currentConfig = await saveConfig({ ...latest, backgroundUrls: next })
+      return true
+    })
+
+  const render = () => {
+    state.draggedEntryId = null
+    state.dragOverEntryId = null
+    list.replaceChildren()
+    const entries = state.currentConfig.backgroundUrls
+    const enabledCount = entries.filter((item) => item.enabled).length
+    listTitle.textContent = 'URL 背景库'
+    librarySummary.textContent = entries.length ? `共 ${entries.length} 条 · ${enabledCount} 条参与随机` : '暂时没有保存的 URL'
+    libraryBadge.textContent = String(entries.length)
+
+    if (!entries.length) {
+      const empty = $el('div', '', '', 'padding:18px 12px; border:1px dashed var(--ct-border); border-radius:9px; text-align:center; color:var(--ct-color-secondary); font-size:12px;')
+      empty.textContent = '还没有 URL。新增后会保存在这里，不会在添加时请求网络。'
+      list.appendChild(empty)
+      return
+    }
+
+    entries.forEach((entry, index) => {
+      const row = $el('div', '', '', 'display:flex; align-items:center; gap:5px; min-height:36px; padding:4px 6px; border:1px solid var(--ct-border); border-radius:9px; background:color-mix(in srgb, var(--ct-surface-elevated) 56%, transparent); transition:border-color .15s ease, background .15s ease, transform .15s ease, box-shadow .15s ease;')
+      row.dataset.ctmUrlRow = entry.id
+      row.title = '拖动左侧手柄调整顺序'
+
+      const dragHandle = $el('span', '', '⋮⋮', 'flex:0 0 15px; width:15px; display:flex; align-items:center; justify-content:center; color:var(--ct-color-secondary); font-size:12px; line-height:1; cursor:grab; user-select:none; opacity:.72; letter-spacing:-2px;')
+      dragHandle.draggable = true
+      dragHandle.title = `拖动调整顺序（当前第 ${index + 1} 项）`
+      const stateDot = $el('span', '', '', `flex:0 0 6px; width:6px; height:6px; border-radius:50%; background:${entry.enabled ? 'var(--ct-accent)' : 'var(--ct-color-secondary)'}; opacity:${entry.enabled ? '1' : '.45'};`)
+      const main = $el('div', '', '', 'flex:1 1 auto; min-width:0; overflow:hidden;')
+      const urlText = $el('div', '', entry.url, 'min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; line-height:16px; color:var(--ct-color-primary);')
+      urlText.title = entry.url
+      const meta = $el('div', 'ctm-hint', '', 'margin-top:0; font-size:9px; opacity:.68;')
+      meta.textContent = `权重 ${entry.weight} · ${entry.enabled ? '参与随机' : '已停用'}`
+      main.append(urlText, meta)
+
+      const weight = $el('input', 'ctm-input')
+      weight.type = 'number'
+      weight.min = '1'
+      weight.max = '10'
+      weight.step = '1'
+      weight.value = String(entry.weight)
+      weight.title = '随机权重 1～10'
+      weight.style.width = '50px'
+      weight.style.flex = '0 0 50px'
+      weight.style.padding = '3px 5px'
+      weight.style.boxSizing = 'border-box'
+      weight.style.height = '26px'
+
+      const enabled = $el('input')
+      enabled.type = 'checkbox'
+      enabled.checked = entry.enabled
+      enabled.title = entry.enabled ? '停用此 URL' : '启用此 URL'
+      enabled.style.width = '13px'
+      enabled.style.height = '13px'
+      enabled.style.flex = '0 0 13px'
+
+      const deleteButton = createButton('删除')
+      deleteButton.style.minWidth = '40px'
+      deleteButton.style.height = '26px'
+      deleteButton.style.padding = '3px 6px'
+
+      const updateEntryPatch = async (patch, label, errorMessage, restore) => {
+        try {
+          await runOnlineImageOperation({ state, syncPrimaryButton: null, label }, async (ctx) => {
+            ctx.assertActive()
+            const latest = await getCachedConfig()
+            state.currentConfig = await saveConfig({
+              ...latest,
+              backgroundUrls: latest.backgroundUrls.map((item) => (item.id === entry.id ? { ...item, ...patch } : item)),
+            })
+            return true
+          })
+          render()
+        } catch (error) {
+          restore?.()
+          if (!error?.cancelled) Plugins.message.error(errText(error, errorMessage))
+        }
+      }
+
+      enabled.onchange = async () => {
+        if (state.queued) {
+          enabled.checked = entry.enabled
+          return
+        }
+        const checked = enabled.checked
+        await updateEntryPatch({ enabled: checked }, 'update-url-enabled', '保存 URL 状态失败', () => {
+          enabled.checked = !checked
+        })
+      }
+
+      weight.onchange = async () => {
+        if (state.queued) {
+          weight.value = String(entry.weight)
+          return
+        }
+        const nextWeight = normalizeBackgroundUrlWeight(weight.value)
+        weight.value = String(nextWeight)
+        await updateEntryPatch({ weight: nextWeight }, 'update-url-weight', '保存 URL 权重失败', () => {
+          weight.value = String(entry.weight)
+        })
+      }
+
+      dragHandle.ondragstart = (event) => {
+        if (state.queued) {
+          event.preventDefault()
+          return
+        }
+        state.draggedEntryId = entry.id
+        state.dragOverEntryId = null
+        row.style.opacity = '.58'
+        row.style.transform = 'scale(.995)'
+        try {
+          event.dataTransfer.effectAllowed = 'move'
+          event.dataTransfer.setData('text/plain', entry.id)
+        } catch {}
+      }
+      dragHandle.ondragend = () => {
+        state.draggedEntryId = null
+        state.dragOverEntryId = null
+        clearDragStyles()
+        row.style.opacity = ''
+      }
+      row.ondragover = (event) => {
+        if (state.queued || !state.draggedEntryId || state.draggedEntryId === entry.id) return
+        event.preventDefault()
+        state.dragOverEntryId = entry.id
+        row.style.borderColor = 'color-mix(in srgb, var(--ct-accent) 55%, var(--ct-border))'
+        row.style.background = 'color-mix(in srgb, var(--ct-accent) 10%, var(--ct-surface-elevated))'
+        row.style.boxShadow = 'inset 0 0 0 1px color-mix(in srgb, var(--ct-accent) 18%, transparent)'
+        try {
+          event.dataTransfer.dropEffect = 'move'
+        } catch {}
+      }
+      row.ondragleave = () => {
+        if (state.dragOverEntryId === entry.id) {
+          state.dragOverEntryId = null
+          row.style.borderColor = 'var(--ct-border)'
+          row.style.background = 'color-mix(in srgb, var(--ct-surface-elevated) 56%, transparent)'
+          row.style.boxShadow = ''
+        }
+      }
+      row.ondrop = async (event) => {
+        event.preventDefault()
+        if (state.queued || !state.draggedEntryId || state.draggedEntryId === entry.id) return
+
+        const sourceId = state.draggedEntryId
+        state.draggedEntryId = null
+        state.dragOverEntryId = null
+        clearDragStyles()
+
+        const latestEntries = [...state.currentConfig.backgroundUrls]
+        const sourceIndex = latestEntries.findIndex((item) => item.id === sourceId)
+        const targetIndex = latestEntries.findIndex((item) => item.id === entry.id)
+        if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+          render()
+          return
+        }
+
+        const [moved] = latestEntries.splice(sourceIndex, 1)
+        const insertIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+        latestEntries.splice(insertIndex, 0, moved)
+
+        try {
+          await persistOrder(latestEntries)
+          render()
+          handlers.showMessage(`已调整 URL 顺序：第 ${sourceIndex + 1} 项 → 第 ${insertIndex + 1} 项。`)
+        } catch (error) {
+          state.currentConfig = await getCachedConfig()
+          render()
+          if (!error?.cancelled) Plugins.message.error(errText(error, '保存 URL 排序失败'))
+        }
+      }
+
+      deleteButton.onclick = () => handlers.deleteEntry(entry.id)
+      row.append(dragHandle, stateDot, main, weight, enabled, deleteButton)
+      list.appendChild(row)
+
+      row.onmouseenter = () => {
+        row.style.background = 'color-mix(in srgb, var(--ct-accent) 5%, var(--ct-surface-elevated))'
+        row.style.borderColor = 'color-mix(in srgb, var(--ct-accent) 30%, var(--ct-border))'
+      }
+      row.onmouseleave = () => {
+        row.style.background = 'color-mix(in srgb, var(--ct-surface-elevated) 56%, transparent)'
+        row.style.borderColor = 'var(--ct-border)'
+      }
+    })
+  }
+
+  return { clearDragStyles, persistOrder, render }
+}
+
+const createOnlineImageActions = ({ state, dom, preview, library, handlers }) => {
+  const { urlInput, weightInput, globalToggle, closeButton, addButton, showMessage } = dom
+
+  const getEnabledEntryCount = () => state.currentConfig.backgroundUrls.filter((item) => item.enabled && item.url).length
+
+  const syncPrimaryButton = () => {
+    const rawValue = urlInput.value.trim()
+    const dynamicEnabled = globalToggle.checked === true
+    const hasUsableEntries = getEnabledEntryCount() > 0
+
+    if (state.saving) {
+      addButton.textContent = !dynamicEnabled ? '正在导入...' : rawValue ? '正在添加并应用...' : '正在随机切换...'
+      addButton.disabled = true
+      return
+    }
+    if (!dynamicEnabled) {
+      addButton.textContent = '导入图片'
+      addButton.disabled = !rawValue
+      return
+    }
+    if (rawValue) {
+      const rawKey = normalizeBackgroundUrlKey(rawValue)
+      const duplicate = state.currentConfig.backgroundUrls.find((item) => normalizeBackgroundUrlKey(item.url) === rawKey)
+      addButton.textContent = duplicate ? '应用此 URL' : '添加并应用'
+      addButton.disabled = false
+      return
+    }
+    addButton.textContent = hasUsableEntries ? '随机换图' : '请输入 URL'
+    addButton.disabled = !hasUsableEntries
+  }
+
+  const syncUrlLibraryVisibility = () => {
+    const enabled = globalToggle.checked === true
+    dom.weightBox.style.display = enabled ? 'flex' : 'none'
+    dom.librarySection.style.display = enabled ? '' : 'none'
+    dom.modeHint.textContent = enabled ? '当前为 URL 背景库模式：点击“添加 URL”只保存地址，启用开关时才会请求并更换背景。' : '当前为普通导入模式：输入图片地址后点击“导入图片”，成功后关闭此窗口。'
+  }
+
+  const addEntry = async () => {
+    if (state.queued) return
+    const rawValue = urlInput.value.trim()
+    const dynamicEnabled = globalToggle.checked === true
+    if (!rawValue && !dynamicEnabled) {
+      showMessage('请输入 URL', 'error')
+      syncPrimaryButton()
+      return
+    }
+
+    if (dynamicEnabled) {
+      const entries = state.currentConfig.backgroundUrls
+      const enabledEntries = entries.filter((item) => item.enabled && item.url)
+      if (!rawValue) {
+        if (!enabledEntries.length) {
+          showMessage('当前没有可参与随机的 URL，请先输入 URL。', 'error')
+          syncPrimaryButton()
+          return
+        }
+        try {
+          await runOnlineImageOperation({ state, dom, syncPrimaryButton, label: 'refresh-url-background', saving: true, disableClose: true }, async (ctx) => {
+            ctx.assertActive()
+            const config = await getCachedConfig()
+            const applied = await applyDynamicBackground(config, ctx, { refreshDynamicUrl: true })
+            if (!applied?.applied) throw new Error('随机刷新 URL 背景失败，当前候选均无法使用')
+            state.currentConfig = applied.config || config
+            return true
+          })
+          showMessage('已按权重随机更换动态背景。')
+          library.render()
+        } catch (error) {
+          if (!error?.cancelled) showMessage(errText(error, '随机切换 URL 背景失败'), 'error')
+          library.render()
+        }
+        return
+      }
+
+      let isNewEntry = false
+      let targetEntry = null
+      try {
+        await runOnlineImageOperation({ state, dom, syncPrimaryButton, label: 'add-or-apply-url-background', saving: true, disableClose: true }, async (ctx) => {
+          ctx.assertActive()
+          const baseConfig = await getCachedConfig()
+          const liveEntries = baseConfig.backgroundUrls
+          const key = normalizeBackgroundUrlKey(rawValue)
+          targetEntry = liveEntries.find((item) => normalizeBackgroundUrlKey(item.url) === key) || null
+
+          if (!targetEntry) {
+            isNewEntry = true
+            targetEntry = {
+              id: createBackgroundUrlId(),
+              url: rawValue,
+              enabled: true,
+              weight: normalizeBackgroundUrlWeight(weightInput.value),
+              cachePath: '',
+            }
+            state.currentConfig = await saveConfig({
+              ...baseConfig,
+              backgroundUrls: [...liveEntries, targetEntry],
+              backgroundUrlEnabled: true,
+            })
+            targetEntry = state.currentConfig.backgroundUrls.find((item) => item.id === targetEntry.id) || targetEntry
+          } else if (!targetEntry.enabled || baseConfig.backgroundUrlEnabled !== true) {
+            state.currentConfig = await saveConfig({
+              ...baseConfig,
+              backgroundUrls: liveEntries.map((item) => (item.id === targetEntry.id ? { ...item, enabled: true } : item)),
+              backgroundUrlEnabled: true,
+            })
+            targetEntry = state.currentConfig.backgroundUrls.find((item) => item.id === targetEntry.id) || targetEntry
+          }
+
+          ctx.assertActive()
+          const refreshed = await refreshDynamicUrlBackgroundEntry(targetEntry, ctx)
+          if (refreshed?.applied) {
+            state.currentConfig = refreshed.config || state.currentConfig
+            return true
+          }
+          const cached = await tryCachedBackgroundUrlEntry(targetEntry, ctx, state.currentConfig)
+          if (!cached?.applied) throw refreshed?.error || new Error('该 URL 暂时无法加载图片')
+          state.currentConfig = cached.config || state.currentConfig
+          return true
+        })
+        urlInput.value = ''
+        preview.release()
+        library.render()
+        preview.update()
+        showMessage(isNewEntry ? 'URL 已加入背景库，并已立即应用为当前壁纸。' : '已立即应用此 URL 背景。')
+      } catch (error) {
+        library.render()
+        if (!error?.cancelled) {
+          const kept = typeof targetEntry?.id === 'string' && state.currentConfig.backgroundUrls.some((item) => item.id === targetEntry.id)
+          showMessage(kept ? `URL 已保留在背景库，但本次图片请求失败：${errText(error, '暂时无法应用')}` : errText(error, '应用 URL 背景失败'), 'error')
+        }
+      }
+      return
+    }
+
+    let url
+    try {
+      url = validateImageUrl(rawValue)
+    } catch (error) {
+      showMessage(errText(error), 'error')
+      return
+    }
+    try {
+      await runOnlineImageOperation({ state, dom, syncPrimaryButton, label: 'import-online-image', saving: true, disableAdd: true, disableClose: true }, async (ctx) => {
+        ctx.assertActive()
+        const baseConfig = await getCachedConfig()
+        showMessage('正在下载图片并保存为当前背景...')
+        const data = await downloadOnlineImage(url, () => !ctx.isActive())
+        ctx.assertActive()
+        const saved = await saveImageBinary({
+          extension: data.extension,
+          existingTempPath: data.tempPath,
+          updateCustomBackground: true,
+          configPatch: { backgroundUrlEnabled: false },
+        })
+        ctx.assertActive()
+        state.currentConfig = saved.config || baseConfig
+        state.currentConfig = await applyThemeInternal(ctx)
+        return true
+      })
+      showMessage('在线图片已导入并应用。')
+      urlInput.value = ''
+      preview.release()
+      state.closed = true
+      try {
+        await state.modal?.close?.()
+      } catch (error) {
+        console.warn('[CustomTheme] 关闭在线图片 Modal 失败:', error)
+      }
+    } catch (error) {
+      if (!error?.cancelled) showMessage(errText(error, '在线图片导入失败'), 'error')
+    }
+  }
+
+  const deleteEntry = async (id) => {
+    if (state.queued) return
+    const target = state.currentConfig.backgroundUrls.find((item) => item.id === id)
+    if (!target) return
+    const confirmed = await confirmDialog('删除 URL', `确定删除这条 URL 背景？\n${target.url}`)
+    if (!confirmed) return
+    try {
+      await runOnlineImageOperation({ state, label: 'delete-url-background' }, async (ctx) => {
+        ctx.assertActive()
+        state.currentConfig = await removeBackgroundUrlEntry(id)
+        return true
+      })
+      library.render()
+    } catch (error) {
+      if (!error?.cancelled) Plugins.message.error(errText(error, '删除 URL 背景失败'))
+    }
+  }
+
+  const toggleGlobal = async () => {
+    if (state.queued) return
+    const enabled = globalToggle.checked === true
+    const previousEnabled = state.currentConfig.backgroundUrlEnabled === true
+    syncUrlLibraryVisibility()
+    syncPrimaryButton()
+    try {
+      await runOnlineImageOperation({ state, syncPrimaryButton, label: 'toggle-url-background' }, async (ctx) => {
+        ctx.assertActive()
+        const baseConfig = await getCachedConfig()
+        state.currentConfig = await saveConfig({ ...baseConfig, backgroundUrlEnabled: enabled })
+        try {
+          if (enabled) {
+            if (getEnabledBackgroundUrls(state.currentConfig).length) {
+              state.currentConfig = await applyThemeInternal(ctx, { refreshDynamicUrl: true })
+            }
+          } else {
+            activeBackgroundUrlId = null
+            state.currentConfig = await applyThemeInternal(ctx)
+          }
+        } catch (error) {
+          const latest = await getCachedConfig()
+          state.currentConfig = await saveConfig({ ...latest, backgroundUrlEnabled: previousEnabled })
+          throw error
+        }
+        return true
+      })
+      showMessage(enabled ? 'URL 动态背景已开启，并已立即刷新背景。' : 'URL 动态背景已关闭。')
+      library.render()
+    } catch (error) {
+      globalToggle.checked = previousEnabled
+      syncUrlLibraryVisibility()
+      syncPrimaryButton()
+      if (!error?.cancelled) Plugins.message.error(errText(error, enabled ? '开启 URL 动态背景失败' : '关闭 URL 动态背景失败'))
+      library.render()
+    }
+  }
+
+  handlers.deleteEntry = deleteEntry
+
+  return { addEntry, deleteEntry, syncPrimaryButton, syncUrlLibraryVisibility, toggleGlobal }
+}
+
+const OnlineImage = async () => {
+  const state = {
+    closed: false,
+    queued: false,
+    saving: false,
+    modal: null,
+    previewVersion: 0,
+    previewObjectUrl: null,
+    previewTimer: null,
+    draggedEntryId: null,
+    dragOverEntryId: null,
+    currentConfig: await getCachedConfig(),
+  }
+
+  const content = $el('div', 'ctm-unified-modal-body ctm-online-image-body', '', 'padding:18px 20px 20px; overflow:visible;')
+  const dom = {}
+  const header = $el('div', '', '', 'display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;')
+  const headerLeft = $el('div', '', '', 'min-width:0;')
+  headerLeft.appendChild($el('div', 'ctm-label', '新增 URL 背景', 'margin:0;'))
+  const modeHint = $el('div', 'ctm-hint', '', 'margin-top:3px;')
+  headerLeft.appendChild(modeHint)
+  header.appendChild(headerLeft)
+  content.appendChild(header)
+
+  const urlInput = $el('input', 'ctm-input')
+  urlInput.type = 'text'
+  urlInput.placeholder = 'https://example.com/image.webp'
+  urlInput.autocomplete = 'off'
+  urlInput.spellcheck = false
+  Object.assign(urlInput.style, { width: '100%', boxSizing: 'border-box', height: '30px', padding: '4px 8px' })
+  content.appendChild(urlInput)
+
+  const settingsRow = $el('div', '', '', 'display:flex; align-items:center; gap:6px; margin-top:6px;')
+  const weightBox = $el('div', '', '', 'display:flex; align-items:center; gap:5px; flex:0 0 auto;')
+  weightBox.appendChild($el('span', 'ctm-label', '权重', 'margin:0; font-size:12px;'))
+  const weightInput = $el('input', 'ctm-input')
+  weightInput.type = 'number'
+  weightInput.min = '1'
+  weightInput.max = '10'
+  weightInput.step = '1'
+  weightInput.value = '10'
+  Object.assign(weightInput.style, { width: '54px', boxSizing: 'border-box', height: '28px', padding: '4px 6px' })
+  weightBox.appendChild(weightInput)
+  settingsRow.appendChild(weightBox)
+
+  const globalToggle = $el('input')
+  globalToggle.type = 'checkbox'
+  globalToggle.checked = state.currentConfig.backgroundUrlEnabled === true
+  Object.assign(globalToggle.style, { width: '13px', height: '13px' })
+  const globalLabel = $el('label', '', '', 'display:flex; align-items:center; gap:5px; margin-left:auto; font-size:11px; color:var(--ct-color-primary); cursor:pointer; user-select:none;')
+  globalLabel.append(globalToggle, $el('span', '', '启用 URL 动态背景'))
+  settingsRow.appendChild(globalLabel)
+  content.appendChild(settingsRow)
+
+  const previewImage = $el('img')
+  previewImage.alt = '图片预览'
+  previewImage.referrerPolicy = 'no-referrer'
+  previewImage.style.display = 'none'
+  const previewText = $el('div', 'ctm-preview-text', '输入 URL 后预览图片')
+  const preview = $el('div', 'ctm-preview', '', 'height:150px; margin-top:10px; border-radius:10px; overflow:hidden; position:relative; display:flex; align-items:center; justify-content:center;')
+  preview.append(previewImage, previewText)
+  content.appendChild(preview)
+
+  const info = $el('div', 'ctm-hint', '', 'min-height:16px; margin-top:7px; white-space:pre-line;')
+  content.appendChild(info)
+  const showMessage = (message, type = 'info') => {
+    info.textContent = message || ''
+    if (type === 'error') Plugins.message.error(message)
+  }
+  dom.info = info
+  dom.showMessage = showMessage
+
+  const librarySection = $el('div', '', '', 'margin-top:10px; padding:9px; border:1px solid var(--ct-border); border-radius:10px; background:color-mix(in srgb, var(--ct-surface-input) 20%, transparent);')
+  const libraryHeader = $el('div', '', '', 'display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:5px;')
+  const libraryHeaderLeft = $el('div', '', '', 'min-width:0;')
+  const listTitle = $el('div', 'ctm-label', '', 'margin:0; font-size:13px;')
+  const librarySummary = $el('div', 'ctm-hint', '', 'margin-top:3px;')
+  libraryHeaderLeft.append(listTitle, librarySummary)
+  libraryHeader.appendChild(libraryHeaderLeft)
+  const libraryBadge = $el('span', '', '', 'display:inline-flex; align-items:center; justify-content:center; min-width:24px; height:19px; padding:0 6px; box-sizing:border-box; border-radius:999px; font-size:11px; font-weight:600; background:color-mix(in srgb, var(--ct-accent) 14%, transparent); color:var(--ct-color-primary);')
+  libraryHeader.appendChild(libraryBadge)
+  librarySection.appendChild(libraryHeader)
+
+  const list = $el('div', '', '', 'display:flex; flex-direction:column; gap:3px; min-height:0;')
+  librarySection.appendChild(list)
+  librarySection.appendChild($el('div', 'ctm-hint', '拖动每条 URL 左侧的排序手柄可自定义顺序；顺序会保存到 URL 背景库，仅影响列表展示顺序。', 'margin-top:5px; line-height:1.25;'))
+  content.appendChild(librarySection)
+
+  const addButton = createButton('导入图片', true)
+  const closeButton = createButton('关闭')
+  const footer = $el('div', 'ctm-footer', '', 'display:flex; align-items:center; justify-content:flex-end; gap:8px; width:100%;')
+  footer.append(closeButton, addButton)
+
+  Object.assign(dom, {
+    urlInput,
+    weightInput,
+    globalToggle,
+    modeHint,
+    weightBox,
+    librarySection,
+    list,
+    listTitle,
+    librarySummary,
+    libraryBadge,
+    previewImage,
+    previewText,
+    preview,
+    info,
+    addButton,
+    closeButton,
+    footer,
+  })
+
+  const handlers = { showMessage: dom.showMessage }
+  const previewController = createOnlineImagePreviewController({
+    state,
+    urlInput,
+    previewImage,
+    previewText,
+    info,
+  })
+  const library = createOnlineImageLibraryController({ state, dom, handlers })
+  const actions = createOnlineImageActions({
+    state,
+    dom,
+    preview: previewController,
+    library,
+    handlers,
+  })
+
+  urlInput.oninput = () => {
+    clearTimeout(state.previewTimer)
+    state.previewTimer = setTimeout(previewController.update, 350)
+    actions.syncPrimaryButton()
+  }
+  addButton.onclick = actions.addEntry
+  globalToggle.onchange = actions.toggleGlobal
+  closeButton.onclick = async () => {
+    state.closed = true
+    try {
+      await state.modal?.close?.()
+    } catch {}
+  }
+
+  library.render()
+  actions.syncPrimaryButton()
+  actions.syncUrlLibraryVisibility()
 
   const contentComponent = createUnifiedDomContent(content, 'CustomThemeOnlineImageContent')
-  modal = createUnifiedModal(
+  const footerComponent = createUnifiedSlotContent(footer, {
+    name: 'CustomThemeOnlineImageFooter',
+    className: 'ctm-online-image-footer',
+    customTheme: false,
+    mountError: '挂载在线图片 Footer 失败',
+  })
+
+  state.modal = createUnifiedModal(
     {
       title: '在线图片',
-      width: '600',
-      height: 'auto',
+      footer: true,
+      cancel: false,
+      submit: false,
+      width: '88',
+      height: '84',
+      maxWidth: '92',
+      maxHeight: '88',
       afterClose: () => {
-        activeUnifiedModals.delete(modal)
-        stopAndCleanup()
+        activeUnifiedModals.delete(state.modal)
+        clearTimeout(state.previewTimer)
+        previewController.release()
         try {
-          modal?.destroy?.()
+          content.remove()
+        } catch {}
+        try {
+          state.modal?.destroy?.()
         } catch {}
       },
     },
     {
-      title: createUnifiedModalTitle('在线图片', '输入图片 URL，下载后保存到本地'),
+      title: createUnifiedModalTitle('在线图片', '普通导入 / URL 动态背景统一管理'),
       default: () => Vue.h(contentComponent),
+      action: () => Vue.h(footerComponent),
     },
   )
-  modal.open()
+
+  state.modal.open()
 }
+
 /*
  * 「请选择背景」与「请选择要使用的图标」两个选择器骨架完全一致：
  * 统一 Modal -> settled/finish 幂等收尾 -> 头部 -> 内容 -> 底部「取消/确认」。
  * 差异只有宽度、文案、内容构建与确认时取哪个值，故抽出公共骨架，避免两处样板各自漂移。
  * buildContent 需返回 { body, refresh, getSelection }。
  */
-const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = '', height = 'auto' }, buildContent) =>
+const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = '', height = 'auto', contentClass = '' }, buildContent) =>
   new Promise((resolve) => {
     let settled = false
     let resultValue = null
     let confirmBtn = null
     let modal = null
 
-    const content = $el('div', 'ctm-unified-modal-body')
+    const content = $el('div', `ctm-unified-modal-body${contentClass ? ` ${contentClass}` : ''}`)
     const finish = (value) => {
       if (settled) return
       settled = true
@@ -2991,51 +3884,103 @@ const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = ''
     modal.open()
     if (typeof built.refresh === 'function') built.refresh()
   })
-const pickPresetBackground = () =>
-  openPickerModal(
+const pickPresetBackground = async () => {
+  const originalState = captureBackgroundState()
+  let currentIndex = normalizeBackgroundIndex(originalState?.backgroundIndex)
+  try {
+    const config = await getCachedConfig()
+    currentIndex = normalizeBackgroundIndex(config.backgroundIndex)
+  } catch {}
+
+  const result = await openPickerModal(
     {
-      width: 520,
-      title: '请选择背景',
-      subtitle: '单击色块实时预览，双击或点击"应用"确认',
-      confirmText: '应用',
-      footerStyle: 'padding: 10px 16px 14px;',
+      width: 640,
+      title: '选择背景',
+      subtitle: '选择预设颜色或渐变背景',
+      confirmText: '应用背景',
+      height: '500',
+      footerStyle: 'padding:8px 12px 10px;',
+      contentClass: 'ctm-background-picker-content',
     },
-    ({ finish, setConfirmEnabled }) => {
-      let selectedIndex = null
-      const grid = $el('div', '', '', 'display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 10px; padding: 12px 16px; overflow: auto; max-height: min(52vh, 420px);')
-      const cells = []
-      const refresh = () => {
-        cells.forEach(({ cell, index }) => {
-          if (index === selectedIndex) {
-            cell.style.borderColor = 'var(--ct-accent)'
-            cell.style.boxShadow = '0 0 0 2px color-mix(in srgb, var(--ct-accent) 30%, transparent)'
-          } else {
-            cell.style.borderColor = 'var(--ct-border)'
-            cell.style.boxShadow = 'none'
-          }
+    ({ setConfirmEnabled }) => {
+      let selectedIndex = currentIndex
+      const body = $el('div', 'ctm-background-picker-body')
+
+      const toolbar = $el('div', 'ctm-background-picker-toolbar')
+      const caption = $el('div', 'ctm-background-picker-caption', '点击卡片预览，确认后才会正式保存当前背景。')
+      const count = $el('span', 'ctm-background-picker-count', `${BACKGROUND_VARIABLE_LIST.length}`)
+      toolbar.append(caption, count)
+      body.appendChild(toolbar)
+
+      const grid = $el('div', 'ctm-background-picker-grid')
+      const cards = []
+      const refreshSelection = () => {
+        cards.forEach(({ card, index }) => {
+          card.classList.toggle('is-selected', index === selectedIndex)
+          card.setAttribute('aria-selected', index === selectedIndex ? 'true' : 'false')
         })
-        setConfirmEnabled(selectedIndex !== null)
+        setConfirmEnabled(Number.isInteger(selectedIndex))
       }
+
       BACKGROUND_VARIABLE_LIST.forEach(([color, gradient], index) => {
-        const cell = $el('div', '', '', `height: 52px; border-radius: 8px; cursor: pointer; border: 1px solid var(--ct-border); background-color: ${color}; background-image: ${gradient}; background-size: cover; background-position: center; transition: border-color .15s ease, box-shadow .15s ease;`)
-        cell.title = `背景${index + 1}`
-        cell.onclick = () => {
-          selectedIndex = index
-          previewPresetBackground(index)
-          refresh()
+        const card = $el('button', 'ctm-background-card')
+        card.type = 'button'
+        card.setAttribute('role', 'option')
+        card.setAttribute('aria-label', `背景 ${index + 1} ${color}`)
+
+        const swatch = $el('div', 'ctm-background-swatch')
+        if (color === '#00000000' && gradient === 'none') {
+          swatch.classList.add('is-transparent')
+        } else {
+          swatch.style.backgroundColor = color || 'transparent'
+          if (gradient && gradient !== 'none') {
+            swatch.style.backgroundImage = gradient
+          }
         }
-        cell.ondblclick = () => {
+
+        const swatchLabel = $el('span', 'ctm-background-swatch-label', index === 0 ? '透明' : `背景 ${String(index + 1).padStart(2, '0')}`)
+        swatch.appendChild(swatchLabel)
+
+        const meta = $el('div', 'ctm-background-card-meta')
+        const name = $el('span', 'ctm-background-card-name', index === 0 ? '透明背景' : `预设背景 ${index + 1}`)
+        const value = $el('span', 'ctm-background-card-value', color || '')
+        meta.append(name, value)
+
+        card.append(swatch, meta)
+        card.onclick = () => {
           selectedIndex = index
-          previewPresetBackground(index)
-          refresh()
-          finish(index)
+          applyPresetBackgroundStyle(index)
+          refreshSelection()
         }
-        cells.push({ cell, index })
-        grid.appendChild(cell)
+        card.onmouseenter = () => {
+          applyPresetBackgroundStyle(index)
+        }
+        card.onmouseleave = () => {
+          if (selectedIndex !== index) {
+            applyPresetBackgroundStyle(selectedIndex)
+          }
+        }
+
+        cards.push({ card, index })
+        grid.appendChild(card)
       })
-      return { body: grid, refresh, getSelection: () => selectedIndex }
+
+      body.appendChild(grid)
+      refreshSelection()
+
+      return {
+        body,
+        getSelection: () => selectedIndex,
+      }
     },
   )
+
+  if (typeof result !== 'number') {
+    restoreBackgroundState(originalState)
+    return null
+  }
+  return result
+}
 /* ==
  * 预设背景
  * == */
@@ -3053,10 +3998,12 @@ const Select = async () => {
         ctx.assertActive()
         const config = await getCachedConfig()
         ctx.assertActive()
+        const selectedIndex = typeof index === 'number' ? normalizeBackgroundIndex(index) : normalizeBackgroundIndex(config.backgroundIndex)
         const newConfig = {
           ...config,
-          backgroundIndex: typeof index === 'number' ? Math.max(0, Math.min(index, BACKGROUND_VARIABLE_LIST.length - 1)) : config.backgroundIndex,
+          backgroundIndex: selectedIndex,
           customBackground: '',
+          backgroundUrlEnabled: false,
         }
         await commitBackgroundRemoval(newConfig)
         if (!ctx.isActive()) {
@@ -3065,7 +4012,7 @@ const Select = async () => {
         /*
          * commit 成功后正式应用。
          */
-        applyPresetBackground(index)
+        applyPresetBackground(newConfig.backgroundIndex)
         return true
       },
       {
@@ -3095,7 +4042,11 @@ const ClearImage = () =>
       const originalState = captureBackgroundState()
       const config = await getCachedConfig()
       ctx.assertActive()
-      const newConfig = { ...config, customBackground: '' }
+      const newConfig = {
+        ...config,
+        customBackground: '',
+        backgroundUrlEnabled: false,
+      }
       try {
         await commitBackgroundRemoval(newConfig)
         if (!ctx.isActive()) {
@@ -3122,6 +4073,20 @@ const clearThemeModalStyle = () => {
 }
 const clearCustomStyle = () => {
   document.getElementById(CUSTOM_STYLE_ID)?.remove()
+}
+const clearRuntimeVisualState = ({ clearRootVariables = false } = {}) => {
+  clearVariableStyle()
+  clearCustomStyle()
+  clearThemeModalStyle()
+  clearBackgroundImage()
+  if (clearRootVariables) {
+    const root = document.documentElement
+    CONSTANTS.FEATURES.VARIABLE_LIST.forEach((property) => {
+      try {
+        root.style.removeProperty(property)
+      } catch {}
+    })
+  }
 }
 const setVariable = (config) => {
   let style = document.getElementById(VARIABLE_STYLE_ID)
@@ -3157,24 +4122,12 @@ const setCustomCSS = (css) => {
     style = document.createElement('style')
     style.id = CUSTOM_STYLE_ID
     style.type = 'text/css'
-    // 【修复】更稳健的 DOM 插入逻辑，确保永远在变量表之后
-    const variableStyle = document.getElementById(VARIABLE_STYLE_ID)
-    if (variableStyle && variableStyle.parentNode) {
-      // 尝试插在变量表后面
-      if (variableStyle.nextSibling) {
-        variableStyle.parentNode.insertBefore(style, variableStyle.nextSibling)
-      } else {
-        variableStyle.parentNode.appendChild(style)
-      }
-    } else {
-      // 兜底：如果变量表还没创建，直接 append 到 head (后续 setVariable 会处理)
-      document.head.appendChild(style)
-    }
+    document.head.appendChild(style)
   }
   style.textContent = css
-  // 确保自定义 CSS 位于 head 的最后，避免宿主主题/组件后续插入的 style 覆盖用户规则。
+  // 只有不在 head 末尾时才移动，避免每次预览/输入都重复 append。
   try {
-    if (style.parentNode === document.head) {
+    if (style.parentNode !== document.head || document.head.lastElementChild !== style) {
       document.head.appendChild(style)
     }
   } catch {}
@@ -3191,18 +4144,8 @@ const readCustomCSS = async () => {
     const raw = await Plugins.ReadFile(CUSTOM_CSS_FILE)
     if (typeof raw !== 'string') return ''
 
-    // 这里只负责读取原始 custom.css，不对 CSS 内容做任何校验。
+    // 这里只负责读取原始 custom.css，不对 CSS 内容做任何校验，也不修改主题配置。
     // CSS 语法由宿主 CodeEditor / CodeMirror / Prettier 负责处理。
-    try {
-      const config = await getCachedConfig()
-      if (config.customCSSPath !== CUSTOM_CSS_NAME && raw.trim()) {
-        config.customCSSPath = CUSTOM_CSS_NAME
-        await saveConfig(config)
-      }
-    } catch (error) {
-      console.warn('[CustomTheme] 回填 custom.css 路径到配置失败:', error)
-    }
-
     return raw
   } catch {
     return ''
@@ -3216,20 +4159,24 @@ const readCustomCSS = async () => {
 /*
  * CSS 应用入口。
  */
-const applyThemeInternal = async (ctx = null) => {
+const applyThemeInternal = async (ctx = null, options = {}) => {
   ctx?.assertActive()
   ensureThemeModalStyle()
-  await migrateStoredConfig()
   ctx?.assertActive()
-  const config = await getCachedConfig()
+  let config = await getCachedConfig()
   ctx?.assertActive()
   setVariable(config)
   ctx?.assertActive()
-  await setBackground(config, ctx)
+  const backgroundApplied = await setBackground(config, ctx, options)
   ctx?.assertActive()
-  const css = await readCustomCSS()
-  ctx?.assertActive()
-  setCustomCSS(css)
+  if (backgroundApplied?.config) config = backgroundApplied.config
+  if (config.customCSSEnabled) {
+    const css = await readCustomCSS()
+    ctx?.assertActive()
+    setCustomCSS(css)
+  } else {
+    clearCustomCSS()
+  }
   return config
 }
 /*
@@ -3254,6 +4201,8 @@ const CustomCSS = async () => {
   ensureThemeModalStyle()
   checkRuntime('CustomCSS', generation)
 
+  const currentCSSConfig = await getCachedConfig()
+  checkRuntime('CustomCSS', generation)
   const originalCSS = await readCustomCSS()
   checkRuntime('CustomCSS', generation)
 
@@ -3275,6 +4224,7 @@ const CustomCSS = async () => {
 
   const state = Vue.reactive({
     css: originalCSS,
+    cssEnabled: currentCSSConfig.customCSSEnabled === true,
     saving: false,
     closed: false,
   })
@@ -3528,6 +4478,17 @@ const CustomCSS = async () => {
               },
               '格式化',
             ),
+            Vue.h('label', { class: 'ctm-css-plugin-css-toggle' }, [
+              Vue.h('input', {
+                type: 'checkbox',
+                checked: state.cssEnabled,
+                disabled: state.saving,
+                onChange: (event) => {
+                  state.cssEnabled = !!event.target.checked
+                },
+              }),
+              Vue.h('span', '启用 custom.css'),
+            ]),
             Vue.h('span', { class: 'ctm-css-plugin-toolbar-spacer' }),
             Vue.h(
               'button',
@@ -3604,7 +4565,7 @@ const CustomCSS = async () => {
   const restoreOnCancel = () => {
     previewing = false
     comparingOriginal = false
-    setCustomCSS(originalCSS)
+    setCustomCSS(currentCSSConfig.customCSSEnabled ? originalCSS : '')
   }
 
   const saveCSS = async () => {
@@ -3623,31 +4584,11 @@ const CustomCSS = async () => {
           ctx.assertActive()
 
           // 语法确认已在进入持久化队列前交给宿主 CodeEditor 完成。
-          await saveCustomCSSText(css)
+          await saveCustomCSSText(css, state.cssEnabled)
 
-          // 回读确认 I/O 完整性，不解析 CSS。
-          let persistedCSS = ''
-          try {
-            const rawPersisted = await Plugins.ReadFile(CUSTOM_CSS_FILE)
-            persistedCSS = typeof rawPersisted === 'string' ? rawPersisted : ''
-          } catch (verifyError) {
-            throw new Error(`CSS 已写入但回读失败：${errText(verifyError)}`)
-          }
-          if (persistedCSS !== css) {
-            throw new Error('CSS 保存失败：磁盘内容与编辑器内容不一致')
-          }
-
-          try {
-            const rawPersistedConfig = await Plugins.ReadFile(THEME_FILE)
-            const persistedConfig = parseConfigText(rawPersistedConfig)
-            if (!persistedConfig || persistedConfig.customCSSPath !== (css.trim() ? CUSTOM_CSS_NAME : '')) {
-              throw new Error('主题配置保存失败：customCSSPath 未同步')
-            }
-          } catch (verifyConfigError) {
-            throw new Error(`主题配置保存确认失败：${errText(verifyConfigError)}`)
-          }
-
-          setCustomCSS(persistedCSS)
+          // saveCustomCSSText 已在持久化函数内部完成 CSS / 配置双重回读验证。
+          // 这里直接使用已验证的编辑器内容，避免保存成功后再发生一次额外 I/O 失败导致误报。
+          setCustomCSS(state.cssEnabled ? css : '')
           return true
         },
         { label: 'save-css' },
@@ -3785,19 +4726,9 @@ const cleanupRuntime = () => {
     activeCSSModal = null
   }
   /*
-   * 清理 Blob URL。
+   * 清理插件运行时样式、背景及其 Blob URL。
    */
-  releaseBackgroundObjectUrl()
-  /*
-   * 清理插件运行时样式。
-   */
-  clearVariableStyle()
-  clearCustomStyle()
-  clearThemeModalStyle()
-  /*
-   * 清理运行时背景。
-   */
-  clearBackgroundImage()
+  clearRuntimeVisualState()
 }
 /* ==
  * Clear
@@ -3809,30 +4740,27 @@ const Clear = () => {
    * 不删除 themes.json / custom.css / 图片。
    * 这是 disable / dispose 使用的。
    */
-  clearVariableStyle()
-  clearCustomStyle()
-  clearThemeModalStyle() // 【修复】补全 Modal 样式清理
-  clearBackgroundImage()
-  /*
-   * 防止 root 上存在旧变量。
-   */
-  const root = document.documentElement
-  CONSTANTS.FEATURES.VARIABLE_LIST.forEach((property) => {
-    try {
-      root.style.removeProperty(property)
-    } catch {}
-  })
+  clearRuntimeVisualState({ clearRootVariables: true })
 }
 const resetThemeInternal = async () => {
-  const config = { variable: {}, backgroundIndex: 0, customBackground: '' }
-  await commitBackgroundRemoval(config)
-  await saveCustomCSSText('')
+  const currentConfig = await getCachedConfig()
+  const config = normalizeConfig({
+    ...currentConfig,
+    variable: {},
+    backgroundIndex: 0,
+    customBackground: '',
+    backgroundUrlEnabled: false,
+    backgroundUrls: currentConfig.backgroundUrls.map((entry) => ({ ...entry, cachePath: '' })),
+    // URL 本身、enabled、weight 保留；cachePath 属于本地缓存状态，Reset 一并清除。
+    // custom.css、customCSSEnabled、customCSSPath 也属于用户长期配置，Reset 不修改。
+  })
+  await commitThemeReset(config)
   clearCustomCSS()
   return config
 }
 const Reset = async (isReset = true) => {
   if (isReset) {
-    const confirmed = await confirmDialog('提示', '主题文件、背景图片和自定义 CSS 将恢复默认！')
+    const confirmed = await confirmDialog('提示', '主题变量和当前背景将恢复默认；URL 背景库与 custom.css 不会删除。')
     if (!confirmed) {
       Plugins.message.info('已取消重置', 1200)
       return false
@@ -4062,7 +4990,7 @@ const CustomIcon = async () => {
     }
     const repoPath = resolveIconRepoPath(iconId, name)
     try {
-      if (await fileExists(repoPath)) {
+      if (await Plugins.FileExists(repoPath)) {
         const base64 = await Plugins.ReadFile(repoPath, { Mode: 'Binary' })
         if (typeof base64 === 'string' && base64) {
           return `data:image/x-icon;base64,${base64}`
@@ -4155,7 +5083,7 @@ const CustomIcon = async () => {
           await safeRemoveFile(rawTemp)
           await safeRemoveFile(runtimeTemp)
           let sourceIsLocal = false
-          if (await fileExists(repoPath)) {
+          if (await Plugins.FileExists(repoPath)) {
             try {
               await validateIcoFile(repoPath)
               await Plugins.CopyFile(repoPath, rawTemp)
@@ -4223,12 +5151,15 @@ const CustomIcon = async () => {
             name: `icon-${String(path).split('/').pop()}`,
           }))
         ctx.assertActive()
-        await executeBackgroundTransaction(
+        await executeFileTransaction(
           async () => {
             await installOwnedIcons(staged, token)
           },
           {
+            baseTargets: [],
             extraTargets: getOwnedIconTransactionTargets(),
+            prefix: BACKGROUND_TX_PREFIX,
+            version: BACKGROUND_TX_VERSION,
           },
         )
         return {
@@ -4306,7 +5237,7 @@ const getCurrentTrayIconPath = () => {
 }
 const refreshTrayIcon = async () => {
   const iconPath = getCurrentTrayIconPath()
-  if (!(await fileExists(iconPath))) {
+  if (!(await Plugins.FileExists(iconPath))) {
     throw new Error(`托盘图标不存在：${iconPath}`)
   }
   if (typeof Plugins.UpdateTray !== 'function') {
@@ -4317,32 +5248,41 @@ const refreshTrayIcon = async () => {
   })
   return iconPath
 }
-const onInstall = () => {
+const enqueueThemeLifecycle = ({ label, errorMessage, prepare, applyOptions, successMessage } = {}) => {
   beginRuntime()
   enqueueThemeOperation(
     async (ctx) => {
       ctx.assertActive()
-      ensureThemeModalStyle()
-      await startup()
+      if (prepare) await prepare(ctx)
       ctx.assertActive()
-      const exists = await fileExists(THEME_FILE)
-      if (!exists) {
-        await saveConfig(DEFAULT_CONFIG)
-      }
-      ctx.assertActive()
-      await ensureFactoryIconBackup()
-      ctx.assertActive()
-      await applyThemeInternal(ctx)
-      return 0
+      const result = await applyThemeInternal(ctx, applyOptions)
+      if (successMessage && ctx.isActive()) Plugins.message.success(successMessage, 1200)
+      return result ?? 0
     },
-    { label: 'onInstall' },
+    { label },
   ).catch((error) => {
     if (error?.cancelled) return
-    console.error('[CustomTheme] onInstall failed:', error)
-    Plugins.message.error(errText(error, '插件安装初始化失败'))
+    console.error(`[CustomTheme] ${label} failed:`, error)
+    Plugins.message.error(errText(error, errorMessage))
   })
   return 0
 }
+const onInstall = () =>
+  enqueueThemeLifecycle({
+    label: 'onInstall',
+    errorMessage: '插件安装初始化失败',
+    prepare: async (ctx) => {
+      ensureThemeModalStyle()
+      ctx.assertActive()
+      await startup()
+      ctx.assertActive()
+      const exists = await Plugins.FileExists(THEME_FILE)
+      if (!exists) await saveConfig(DEFAULT_CONFIG)
+      ctx.assertActive()
+      await ensureFactoryIconBackup()
+    },
+    applyOptions: { refreshDynamicUrl: true },
+  })
 let uninstalling = false
 const onUninstall = async () => {
   if (uninstalling) return 0
@@ -4404,43 +5344,19 @@ const runUninstallCleanup = async () => {
   }
   return removed
 }
-const onReady = () => {
-  beginRuntime()
-  enqueueThemeOperation(
-    async (ctx) => {
-      ctx.assertActive()
-      await startup()
-      ctx.assertActive()
-      await applyThemeInternal(ctx)
-      return 0
-    },
-    { label: 'onReady' },
-  ).catch((error) => {
-    if (error?.cancelled) return
-    console.error('[CustomTheme] onReady failed:', error)
-    Plugins.message.error(errText(error, '主题初始化失败'))
+const onReady = () =>
+  enqueueThemeLifecycle({
+    label: 'onReady',
+    errorMessage: '主题初始化失败',
+    prepare: startup,
+    applyOptions: { refreshDynamicUrl: true },
   })
-  return 0
-}
-const onRun = () => {
-  beginRuntime()
-  enqueueThemeOperation(
-    async (ctx) => {
-      ctx.assertActive()
-      await applyThemeInternal(ctx)
-      if (ctx.isActive()) {
-        Plugins.message.success('主题已生效', 1200)
-      }
-      return 0
-    },
-    { label: 'onRun' },
-  ).catch((error) => {
-    if (error?.cancelled) return
-    console.error('[CustomTheme] onRun failed:', error)
-    Plugins.message.error(errText(error, '主题应用失败'))
+const onRun = () =>
+  enqueueThemeLifecycle({
+    label: 'onRun',
+    errorMessage: '主题应用失败',
+    successMessage: '主题已生效',
   })
-  return 0
-}
 const handleLifecycleCleanup = (functionName) => {
   try {
     cleanupRuntime()
@@ -4470,13 +5386,15 @@ const onConfigure = () => {
     /*
      * onConfigure 不能改成 async（返回值是退出码），用 then 单独打一条。
      */
-    getRequestProxyInfo()
-      .then((proxy) => {
-        console.log('[CustomTheme] 请求代理:', proxy === null ? '未知' : proxy || '空（图片下载会直连）')
-      })
-      .catch((error) => {
-        console.warn('[CustomTheme] 请求代理自检失败:', error)
-      })
+    if (typeof Plugins.GetRequestProxy === 'function') {
+      Plugins.GetRequestProxy()
+        .then((proxy) => {
+          console.log('[CustomTheme] 请求代理:', proxy === null ? '未知' : proxy || '空（图片下载会直连）')
+        })
+        .catch((error) => {
+          console.warn('[CustomTheme] 请求代理自检失败:', error)
+        })
+    }
   } catch {}
   return 0
 }

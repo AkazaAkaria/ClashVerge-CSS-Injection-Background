@@ -78,12 +78,29 @@ body[theme-mode='dark'] .gui-modal-modal {
 }
 /* =====================================================
   3) 全局奶白薄纱层（可选）
-原理：- body 背景作为底层 canvas 背景 - body::after 创建固定覆盖层 - z-index:-1 位于内容层以下 - 插件更换任何背景时仍然生效
+原理：- body 背景 = 壁纸，画在 body 自己层叠上下文的最底层
+     - body{isolation:isolate} 让 body 成为【层叠上下文】
+     - body::after 用 z-index:-1 落在 body 自己的负层
+       ⇒ 天然位于「壁纸之上、所有页面内容之下」
 效果：- 降低背景对文字的干扰 - 增加统一玻璃质感
 如果需要纯背景效果：删除整个 body::after 部分即可
+⚠️ 2026-09-27 根治（原为「::after(0) + #app{z-index:1}」）：
+   那条 #app 的 z-index 会把 #app 变成【层叠上下文】，连带把 #app 内部所有浮层的
+   层叠级别锁死在 1 之下；而宿主弹窗遮罩 .gui-modal-mask 走【内联 z-index 1001/1009】、
+   挂在 body > div#Modal-ID_xxxxx 下，在 #app 之外 ⇒ 弹窗整体盖住浮层。
+   事故表现：弹窗内右键，.gui-menu(z-9999) 不出现 / 浮在窗口下面；.gui-tips、右下角悬浮按钮同理。
+   ✅ 实测层序（Chromium/WebView2，本文件方案下）：
+      .gui-menu / .gui-tips(9999) > 弹窗遮罩(1001/1009) > #app 内容 > 薄纱(-1) > 壁纸
+   ⛔ 不要给 #app 加 z-index；⛔ 也不要「只删 #app 的 z-index、把薄纱留在 ::after(0)」
+      —— 实测那样薄纱会反过来盖住整个页面内容（它俩同在层叠第 6 步、按 DOM 顺序比）。
 ===================================================== */
 body {
   position: relative;
+  /* ★ 2026-09-27：让 body 成为层叠上下文。只有成为层叠上下文，下面 ::after 的
+     z-index:-1 才会「夹」在 body 自己的壁纸与页面内容之间；否则 -1 会参与【根】层叠上下文
+     而沉到壁纸之下、完全看不见 —— 这正是 2026-09-24 那条「勿改成 -1」结论成立的前提，
+     加上本行后前提被打破，-1 才可用。*/
+  isolation: isolate;
 }
 body::after {
   content: '';
@@ -91,32 +108,36 @@ body::after {
   position: fixed;
   inset: 0;
   /*放到底层，不阻挡鼠标事件*/
-  /* 注：原来这里写了两次 z-index（先 -1 再 0，后者生效＝死代码），
-     2026-09-24 整理为只写生效值 0。行为与之前完全一致，勿再改成 -1：
-     壁纸是挂在 body 背景上的，-1 会让薄纱沉到壁纸下面而看不见。 */
-  z-index: 0;
+  /* ★ 2026-09-27：由 0 改为 -1。0 与 #app 同处「层叠第 6 步」，必须靠 #app 提 z-index
+     才压得住它 —— 而那个 z-index 就是右键菜单被弹窗盖住的元凶。改成 -1 后自动落到
+     所有内容之下，不必再动 #app。前提：body 必须是层叠上下文（见上面的 isolation）。*/
+  z-index: -1;
   pointer-events: none;
 }
 #app {
   position: relative;
-  z-index: 1;
+  /* ⛔ 不要再写 z-index！一旦 #app 成为层叠上下文，它内部所有浮层（右键菜单 / tooltip /
+     右下角悬浮按钮）的层叠级别都被锁死在 #app 内部，永远低于宿主 body 级的
+     .gui-modal-mask(内联 1001/1009)，表现为「右键菜单浮在窗口下面」。2026-09-27 事故即此。 */
 }
-/* ⚠️ 2026-09-24【弹窗保险层】——只兜底「拿不到内联 z-index」的弹窗。
-   上面 #app 的 z-index:1 是为了压住 body::after(0) 的全局薄纱；而宿主的弹窗
-   （Modal/index.vue）z-index 走【内联】：`:style="{ zIndex: modalZindex }"`，
-   值来自 `++appStore.modalZIndexCounter`（全局递增，从 1000 起、只增不减），
-   赋值写在 `watch(open)` 里且【没有 immediate】：
-     · 由「open 从 false 变 true」打开的弹窗 → 拿到内联值（实测 1054），本来就在 #app 之上；
-     · 「初始 open 就为 true」的弹窗（向导弹窗等） → modalZindex 恒为 undefined，
-       Vue 不写 z-index → 元素 z-index:auto → 会被 #app(1) 盖住，弹窗内点击全被 #app 接走。
-   所以必须加 :not([style*='z-index']) 限定，只给后一类兜底：
-     · 有内联 z-index 的弹窗 → 本规则不命中，保留宿主「后开的在上」的递增层叠序；
-     · 拿不到内联值的弹窗   → 兜底到 1000，压过 #app(1)。
-   ⛔ 教训：早先写成 `z-index: 1000 !important` 是错的 —— !important 会把宿主的
-      1054 一并压成 1000，毁掉递增序（多弹窗 / 最小化恢复会错层）。勿改回 !important。 */
-body > .gui-modal-mask:not([style*='z-index']) {
-  z-index: 1000;
+/* ✅ 2026-09-27：【弹窗保险层】已删除（原为
+   `body > .gui-modal-mask:not([style*='z-index']) { z-index: 1000 }`），两个原因：
+   ① 它从来没命中过 —— 实测 DOM 是 body > div#Modal-ID_xxxxx > .gui-modal-mask，
+      遮罩并不是 body 的直接子元素（要么补成 body > div > .gui-modal-mask 才可能生效）；
+   ② 删掉 #app 的 z-index 后它也不再需要：#app 不再是层叠上下文，
+      「初始 open 就为 true」的内联无 z-index 遮罩（position:fixed、z-index:auto）与 #app
+      同处层叠第 6 步、按 DOM 顺序比较，而 #app 在 DOM 中更靠前 ⇒ 遮罩天然在 #app 之上，
+      不会再出现「弹窗内点击被 #app 接走」。实测：删除后 APP 内容仍被遮罩正常压暗。
+   ⛔ 若将来又把 #app 变成层叠上下文，必须同时把保险层加回来（并写成 body > div > .gui-modal-mask）。 */
+/* ⚠️ 2026-09-27【可选】右下角悬浮按钮的层叠回收。
+   #app 不再是层叠上下文后，#app 内所有 z-9999 元素都会与弹窗遮罩(1001/1009) 同层比较，
+   并因 9999 > 1009 浮到弹窗之上 —— 对 .gui-menu / .gui-tips 正是我们想要的，
+   但右下角那颗悬浮按钮（实测 DOM：body > #app > div.fixed.right-32.bottom-32.z-9999）
+   通常不希望盖住弹窗。需要时取消下面注释（给一个「高于 #app 内容、低于弹窗」的级别即可）：
+#app > div.fixed.right-32.bottom-32 {
+  z-index: 100;
 }
+*/
 /* 浅色模式全局柔光 */
 body[theme-mode='light']::after {
   /*上方更亮，下方保持透明，模拟顶部柔光效果*/
