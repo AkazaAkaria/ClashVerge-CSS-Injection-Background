@@ -1,4 +1,4 @@
-/* VERSION: v11.7-patch1-url-layout-reference-restored */
+/* VERSION: v11.7-patch7-tray-diagnostic-and-versionstamp */
 const CONSTANTS = {
   PATHS: {
     THEME: 'data/third/custom-singbox-theme',
@@ -16,6 +16,21 @@ const CONSTANTS = {
     ONLINE_IMAGE_TIMEOUT: 90,
     CONFIG_CACHE_TTL: 60000,
     MAX_IMAGE_SIZE_MB: 30,
+    /*
+     * 启动阶段的 URL 背景刷新：
+     * 单条超时（秒）。平时的手动刷新仍用 ONLINE_IMAGE_TIMEOUT，
+     * 只有 onReady / onInstall 的启动刷新走这个短超时，避免把主题队列占满。
+     */
+    STARTUP_REFRESH_TIMEOUT: 10,
+    STARTUP_REFRESH_MAX_ATTEMPTS: 3,
+    /*
+     * 手动刷新（面板里点刷新 / onRun）的总时长闸门。
+     * 旧行为：budgetMs = Infinity，配 N 条不可达 URL 时会把整条主题队列占满，
+     * 最坏 N × 180s ≈ 30 分钟，期间所有菜单排队 ⇒ 表现为「卡死」。
+     * 这里与启动刷新同构，只是更宽松一点（用户是主动等待的）。
+     */
+    MANUAL_REFRESH_TIMEOUT: 25,
+    MANUAL_REFRESH_MAX_ATTEMPTS: 3,
   },
   UI: {
     ICON_PICK_SIZE: 20,
@@ -188,6 +203,10 @@ const ICON_MAX_FILE_SIZE = CONSTANTS.LIMITS.MAX_ICON_FILE_SIZE
 const ICON_DOWNLOAD_TIMEOUT_SECONDS = CONSTANTS.LIMITS.ICON_DOWNLOAD_TIMEOUT
 const ONLINE_IMAGE_TIMEOUT_SECONDS = CONSTANTS.LIMITS.ONLINE_IMAGE_TIMEOUT
 const CONFIG_CACHE_TTL = CONSTANTS.LIMITS.CONFIG_CACHE_TTL
+const STARTUP_REFRESH_TIMEOUT_SECONDS = CONSTANTS.LIMITS.STARTUP_REFRESH_TIMEOUT
+const STARTUP_REFRESH_MAX_ATTEMPTS = CONSTANTS.LIMITS.STARTUP_REFRESH_MAX_ATTEMPTS
+const MANUAL_REFRESH_TIMEOUT_SECONDS = CONSTANTS.LIMITS.MANUAL_REFRESH_TIMEOUT
+const MANUAL_REFRESH_MAX_ATTEMPTS = CONSTANTS.LIMITS.MANUAL_REFRESH_MAX_ATTEMPTS
 const ICON_PICK_SIZE = CONSTANTS.UI.ICON_PICK_SIZE
 const ICON_PICK_GAP = CONSTANTS.UI.ICON_PICK_GAP
 
@@ -231,6 +250,12 @@ const DEFAULT_CONFIG = {
   backgroundUrls: [],
   customCSSEnabled: false,
   customCSSPath: '',
+  /*
+   * 当前生效的自选图标集 id；空字符串表示正在使用原厂图标。
+   * 有值 ⇒ 插件在启动时会校验 data/.cache/icons 下的图标是否齐全，
+   * 缺失时用 data/third/custom-singbox-theme/icons/<iconId> 重建。
+   */
+  iconId: '',
 }
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -265,6 +290,17 @@ const normalizeBackgroundIndex = (index) => {
   const value = Number(index)
   if (!Number.isFinite(value)) return 0
   return Math.max(0, Math.min(Math.floor(value), BACKGROUND_VARIABLE_LIST.length - 1))
+}
+/*
+ * 归一化自选图标集 id。
+ *
+ * iconId 会被拼进文件路径（ICON_REPO_DIR/<iconId>/<name>.ico），
+ * 所以必须拒绝空白、路径分隔符与 Windows 非法字符，避免路径穿越。
+ */
+const normalizeIconId = (value) => {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  return /^[^\s/\\:*?"<>|]{1,64}$/.test(trimmed) ? trimmed : ''
 }
 /*
  * 主题配置里只记录 custom.css 的「文件名」，不记录完整路径：
@@ -351,6 +387,7 @@ const normalizeConfig = (config) => {
     backgroundUrls,
     customCSSEnabled,
     customCSSPath,
+    iconId: normalizeIconId(safeConfig.iconId),
   }
   delete normalized.backgroundUrl
   delete normalized.allowExternalHttps
@@ -604,6 +641,13 @@ const cleanupIconTempFiles = async () => {
   }
 }
 const getFactoryIconPath = (finalPath) => `${ICON_FACTORY_DIR}/${String(finalPath).split('/').pop()}`
+/*
+ * 图标集的持久化来源路径。
+ *
+ * 这份文件不在 data/.cache 下：
+ * 只要它存在，data/.cache/icons 被宿主清空/升级后仍可由插件自行重建。
+ */
+const getIconSetSourcePath = (iconId, name) => `${ICON_REPO_DIR}/${iconId}/${name}.ico`
 const ensureFactoryIconBackup = async () => {
   let backed = 0
   for (const finalPath of getOwnedIconPaths()) {
@@ -619,22 +663,40 @@ const ensureFactoryIconBackup = async () => {
   }
   return backed
 }
+/*
+ * 【P1 修复】还原原厂图标改为事务式（与 installOwnedIcons 同构）。
+ *
+ * 旧实现是「先删线上图标 → 再 CopyFile 备份」：
+ * CopyFile 一旦失败，托盘文件已经被删掉了 ⇒ 托盘空白；
+ * 更糟的是这种失败**不进 pending**，卸载清理会认为「一切正常」
+ * 从而把 icons/original 里唯一的原厂备份一起删掉。
+ */
 const resetOwnedIcons = async () => {
   const restored = []
   const pending = []
   for (const finalPath of getOwnedIconPaths()) {
     const backupPath = getFactoryIconPath(finalPath)
-    if (await Plugins.FileExists(backupPath)) {
-      try {
-        await safeRemoveFile(finalPath)
-        await Plugins.CopyFile(backupPath, finalPath)
-        restored.push(finalPath)
-        continue
-      } catch (error) {
-        console.error('[CustomIcon] 恢复原厂图标失败:', finalPath, error)
-      }
+    if (!(await Plugins.FileExists(backupPath))) {
+      await safeRemoveFile(finalPath)
+      pending.push(finalPath)
+      continue
     }
-    await safeRemoveFile(finalPath)
+    const nextPath = `${finalPath}.next`
+    try {
+      await safeRemoveFile(nextPath)
+      await Plugins.CopyFile(backupPath, nextPath)
+      await atomicMoveFile(nextPath, finalPath)
+      restored.push(finalPath)
+      continue
+    } catch (error) {
+      console.error('[CustomIcon] 恢复原厂图标失败:', finalPath, error)
+      await safeRemoveFile(nextPath)
+    }
+    /*
+     * 失败同样记进 pending：
+     * 此时 finalPath 的状态未知（可能还是自选图标、也可能已缺失），
+     * 必须保住 icons/original，卸载清理才不会把唯一备份一起删掉。
+     */
     pending.push(finalPath)
   }
   return { restored, pending }
@@ -754,6 +816,134 @@ const installOwnedIcons = async (staged, token) => {
   }
   return staged.length
 }
+/*
+ * 读取 data/.cache/icons 下本插件自管图标的完整性。
+ */
+const readOwnedIconState = async () => {
+  const present = []
+  const missing = []
+  for (const finalPath of getOwnedIconPaths()) {
+    if (await Plugins.FileExists(finalPath)) present.push(finalPath)
+    else missing.push(finalPath)
+  }
+  return { present, missing }
+}
+/*
+ * 自愈时使用图标集源文件作为输入。
+ * Linux 托盘只认 PNG，需要先把 ICO 转成临时 PNG。
+ */
+const prepareIconSourceTemp = async (repoPath, token, name) => {
+  if (!ICON_ENV.isLinux) return { path: repoPath, isTemp: false }
+  const tempPath = `${ICON_CACHE_DIR}/${ICON_TEMP_PREFIX}${token}_${name}.tmp`
+  await safeRemoveFile(tempPath)
+  const rawBase64 = await Plugins.ReadFile(repoPath, { Mode: 'Binary' })
+  const pngBase64 = await icoToPngBase64(rawBase64)
+  await Plugins.WriteFile(tempPath, pngBase64, { Mode: 'Binary' })
+  await validatePngFile(tempPath)
+  return { path: tempPath, isTemp: true }
+}
+/*
+ * 用 icons/<iconId> 下的源文件重建全部自管图标。
+ * 全程只碰本地文件，不发起任何网络请求。
+ */
+const restoreOwnedIconsFromRepo = async (iconId) => {
+  const token = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const staged = []
+  const missingSources = []
+  const tempFiles = []
+  try {
+    for (const name of OWNED_ICON_NAMES) {
+      const repoPath = getIconSetSourcePath(iconId, name)
+      if (!(await Plugins.FileExists(repoPath))) {
+        missingSources.push(name)
+        continue
+      }
+      try {
+        await validateIcoFile(repoPath)
+        const source = await prepareIconSourceTemp(repoPath, token, name)
+        if (source.isTemp) tempFiles.push(source.path)
+        staged.push({
+          name,
+          rawTemp: repoPath,
+          runtimeTemp: source.path,
+          sourceTemp: source.path,
+          darkPath: `${ICON_CACHE_DIR}/${name}_dark${ICON_EXT}`,
+          lightPath: `${ICON_CACHE_DIR}/${name}_light${ICON_EXT}`,
+        })
+      } catch (error) {
+        console.warn('[CustomIcon] 图标源自愈校验失败:', repoPath, error)
+        missingSources.push(name)
+      }
+    }
+    if (!staged.length) return { installed: 0, missingSources }
+    const installed = await installOwnedIcons(staged, token)
+    return { installed, missingSources }
+  } catch (error) {
+    console.error('[CustomIcon] 图标自愈失败:', error)
+    return { installed: 0, missingSources, error }
+  } finally {
+    for (const tempPath of tempFiles) {
+      await safeRemoveFile(tempPath)
+    }
+  }
+}
+/*
+ * 启动自检（每次 onReady / onInstall 都会跑）：
+ *
+ * 1. 未启用自选图标 ⇒ 缓存内容仍是原厂图标，可以安全补建原厂备份。
+ *    一旦启用了自选图标就绝不能再备份，否则会把自选图标当作
+ *    「原厂图标」写进唯一可用的还原来源，还原功能就此失效。
+ * 2. 已启用自选图标但缓存文件缺失（宿主升级 / 清缓存）⇒ 从
+ *    icons/<iconId> 重建，并尝试刷新托盘。
+ */
+const bootstrapIcons = async () => {
+  let iconId = ''
+  try {
+    iconId = normalizeIconId((await getCachedConfig())?.iconId)
+  } catch (error) {
+    console.warn('[CustomIcon] 启动自检读取配置失败:', error)
+  }
+  if (!iconId) {
+    const backed = await ensureFactoryIconBackup()
+    if (backed) console.log(`[CustomIcon] 已补建原厂图标备份：${backed} 个`)
+    return { state: 'factory', backed }
+  }
+  const { missing } = await readOwnedIconState()
+  if (!missing.length) return { state: 'intact', iconId }
+  console.log(`[CustomIcon] 检测到 ${missing.length} 个自选图标缺失，开始自愈：${iconId}`)
+  const { installed, missingSources } = await restoreOwnedIconsFromRepo(iconId)
+  if (installed) {
+    /*
+     * 启动阶段托盘可能还没建好，刷新失败不影响正确性：
+     * 文件已经就位，下次重启托盘就会读到新图标。
+     */
+    try {
+      await refreshTrayIcon()
+    } catch (error) {
+      console.warn('[CustomIcon] 图标已自愈，但实时刷新托盘失败（重启客户端后生效）:', error)
+    }
+  }
+  if (missingSources.length) {
+    Plugins.message.warn(`自选图标「${iconId}」有 ${missingSources.length} 组源文件缺失，无法自动恢复，请重新选择图标`, 3200)
+  } else if (installed) {
+    Plugins.message.success('自选图标已自动恢复', 1500)
+  }
+  return { state: installed ? 'healed' : 'failed', iconId, installed, missingSources }
+}
+/*
+ * 记录当前生效的自选图标集。
+ * 写失败只记日志：图标本身已经装好，配置缺失只会退化成「不自动自愈」。
+ */
+const saveActiveIconId = async (iconId) => {
+  try {
+    const config = await getCachedConfig()
+    await saveConfig({ ...config, iconId: normalizeIconId(iconId) })
+    return true
+  } catch (error) {
+    console.warn('[CustomIcon] 记录自选图标状态失败:', error)
+    return false
+  }
+}
 const purgeLegacyFiles = async () => {
   for (const extension of FEATURES_IMAGE_FORMATS) await safeRemoveFile(`${CUSTOM_BG_PREFIX}${extension}.bak`)
   try {
@@ -853,6 +1043,11 @@ const startup = async () => {
   await purgeLegacyFiles()
   await cleanupIconTempFiles()
   await cleanupPluginTempFiles()
+  /*
+   * 图标自检必须放在临时文件清理之后，
+   * 否则自愈刚写出的临时 PNG 可能被当作残留删掉。
+   */
+  await bootstrapIcons()
 }
 const readFilePrefix = async (path, bytes = 128) => {
   const maxChars = Math.ceil(bytes / 3) * 4 + 8
@@ -1123,7 +1318,6 @@ const loadBackgroundImageFile = async (relativePath) => {
     return null
   }
 }
-const loadCustomBackground = async (config) => loadBackgroundImageFile(config?.customBackground)
 let activeBackgroundUrlId = null
 const getEnabledBackgroundUrls = (config) => (Array.isArray(config?.backgroundUrls) ? config.backgroundUrls : []).filter((entry) => entry.enabled && entry.url)
 const pickWeightedBackgroundUrl = (entries) => {
@@ -1153,7 +1347,7 @@ const getBackgroundUrlCachePath = (entry, extension = '') => {
  * - 请求失败且没有缓存时，从剩余候选继续按 weight 随机。
  * - 全部失败后回退普通背景。
  */
-const refreshDynamicUrlBackgroundEntry = async (entry, ctx = null) => {
+const refreshDynamicUrlBackgroundEntry = async (entry, ctx = null, options = null) => {
   let url
   try {
     url = validateImageUrl(entry.url)
@@ -1163,7 +1357,7 @@ const refreshDynamicUrlBackgroundEntry = async (entry, ctx = null) => {
   }
   ctx?.assertActive()
   try {
-    const data = await downloadOnlineImage(url, () => !!ctx && !ctx.isActive())
+    const data = await downloadOnlineImage(url, () => !!ctx && !ctx.isActive(), options || undefined)
     ctx?.assertActive()
     const currentConfig = await getCachedConfig()
     const currentEntry = (Array.isArray(currentConfig.backgroundUrls) ? currentConfig.backgroundUrls : []).find((item) => item.id === entry.id)
@@ -1218,15 +1412,49 @@ const applyDynamicBackground = async (config, ctx = null, options = {}) => {
   if (!candidates.length) return { applied: false, config }
 
   if (options.refreshDynamicUrl === true) {
+    /*
+     * 【P1 修复】启动刷新与手动刷新都带「条数 + 总时长」双闸门。
+     *
+     * 旧行为：启动时会把每条 enabled URL 都串行请求一遍，
+     * 单条最坏 90s × 2 次重试 ≈ 180s，全部排在主题队列里，
+     * 期间用户点任何菜单都在排队 ⇒ 表现为「启动后几分钟内插件像卡死」。
+     *
+     * 手动刷新（onRun / 面板里点刷新）原本 budgetMs = Infinity，
+     * 配 N 条不可达 URL 时会把整条主题队列占满 ~N×180s ≈ 30 分钟，
+     * 同样表现为卡死。这里与启动刷新同构，只是参数更宽松（用户主动等待）。
+     */
+    const startup = options.startupRefresh === true
+    const maxAttempts = startup ? Math.max(1, STARTUP_REFRESH_MAX_ATTEMPTS) : Math.min(candidates.length, MANUAL_REFRESH_MAX_ATTEMPTS)
+    const budgetMs = startup ? (STARTUP_REFRESH_TIMEOUT_SECONDS * maxAttempts + 5) * 1000 : MANUAL_REFRESH_TIMEOUT_SECONDS * 1000
+    const startedAt = Date.now()
     const remaining = [...candidates]
+    let attempts = 0
     while (remaining.length) {
       ctx?.assertActive()
+      if (attempts >= maxAttempts) {
+        console.warn(`[CustomTheme] 启动刷新已达上限 ${maxAttempts} 条，剩余 URL 改用本地缓存`)
+        break
+      }
+      if (Date.now() - startedAt > budgetMs) {
+        console.warn(`[CustomTheme] 启动刷新超出时间预算 ${Math.round(budgetMs / 1000)}s，剩余 URL 改用本地缓存`)
+        break
+      }
+      attempts += 1
       const entry = pickWeightedBackgroundUrl(remaining)
       if (!entry) break
       const index = remaining.findIndex((item) => item.id === entry.id)
       if (index >= 0) remaining.splice(index, 1)
-      const refreshed = await refreshDynamicUrlBackgroundEntry(entry, ctx)
+      const refreshed = await refreshDynamicUrlBackgroundEntry(entry, ctx, startup ? { timeoutSeconds: STARTUP_REFRESH_TIMEOUT_SECONDS } : null)
       if (refreshed?.applied) return refreshed
+      const cached = await tryCachedBackgroundUrlEntry(entry, ctx, config)
+      if (cached?.applied) return cached
+    }
+    /*
+     * 刷新失败（或超出预算）后仍然要走一遍缓存：
+     * 否则只要有网络抖动，启动就会退回纯色背景。
+     */
+    for (const entry of remaining) {
+      ctx?.assertActive()
       const cached = await tryCachedBackgroundUrlEntry(entry, ctx, config)
       if (cached?.applied) return cached
     }
@@ -1313,7 +1541,9 @@ const atomicWriteFile = async (targetPath, contentOrSource, isBinary = false) =>
     if (await Plugins.FileExists(bakPath)) {
       try {
         await Plugins.CopyFile(bakPath, targetPath)
-      } catch {}
+      } catch (error) {
+        console.warn('[AtomicWrite] 回滚恢复备份失败:', error)
+      }
     }
     await safeRemoveFile(newPath)
     await safeRemoveFile(bakPath)
@@ -1340,7 +1570,9 @@ const atomicMoveFile = async (sourcePath, targetPath) => {
     if (await Plugins.FileExists(bakPath)) {
       try {
         await Plugins.CopyFile(bakPath, targetPath)
-      } catch {}
+      } catch (rollbackError) {
+        console.warn('[AtomicWrite] 回滚恢复备份失败:', rollbackError)
+      }
     }
     await safeRemoveFile(bakPath)
     throw error
@@ -1419,7 +1651,9 @@ const restoreFileTransactionSnapshot = async (transaction) => {
     try {
       const removed = await safeRemoveFile(item.path)
       if (!removed && (await Plugins.FileExists(item.path))) errors.push(`${item.path}: 删除当前文件失败`)
-    } catch (error) {}
+    } catch (error) {
+      errors.push(`${item.path}: 回滚删除当前文件失败：${errText(error)}`)
+    }
   }
   for (const item of transaction.targets) {
     if (!item.existed || !item.backupPath) continue
@@ -1692,6 +1926,16 @@ const commitBackgroundRemoval = async (newConfig) =>
     await removeAllCustomBackgroundsStrict()
   })
 const activeFilePickerCancellers = new Set()
+/*
+ * 「选择背景 / 选择图标」等统一 Modal 的 Promise 收口集合。
+ *
+ * 宿主的 afterClose 只在 modal.close() 的正常流程里派发；
+ * 清理时 destroyUnifiedModals() 直接调 modal.destroy?.()，不保证派发 afterClose。
+ * 若只 destroy 而不收口，await openPickerModal(...) 会永久挂起
+ * （开着弹窗时禁用插件 / 重载 APP 尤其明显，不报错、不崩溃、后续还原代码全不执行）。
+ * 这里统一登记 settle，清理段调用即可立即 resolve。
+ */
+const activeModalCancellers = new Set()
 const openImageFilePicker = () => {
   const input = document.createElement('input')
   input.type = 'file'
@@ -1888,6 +2132,7 @@ const SelectImage = async () => {
     await enqueueThemeOperation(
       async (ctx) => {
         ctx.assertActive()
+        await ensureThemeVisualsRestored(ctx)
         const base64 = await fileToBase64(file)
         ctx.assertActive()
         await saveImageBinary({
@@ -2216,9 +2461,15 @@ const getResponseHeaderValue = (headers, name) => {
   if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0].trim() : ''
   return typeof value === 'string' ? value.trim() : ''
 }
-const downloadOnlineImage = async (url, isCancelled = () => false) => {
+const downloadOnlineImage = async (url, isCancelled = () => false, options = {}) => {
   const MAX_REDIRECTS = 5
   const headers = { Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' }
+  /*
+   * 启动阶段（onReady / onInstall）用短超时：
+   * 平时一条 URL 最坏 90s × 2 次重试 ≈ 180s，全部串在主题队列里，
+   * 期间所有菜单都在排队，看上去像卡死。
+   */
+  const timeoutSeconds = Number.isFinite(options.timeoutSeconds) && options.timeoutSeconds > 0 ? options.timeoutSeconds : ONLINE_IMAGE_TIMEOUT_SECONDS
 
   const attempt = async () => {
     let currentUrl = validateImageUrl(url)
@@ -2228,7 +2479,7 @@ const downloadOnlineImage = async (url, isCancelled = () => false) => {
         if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
 
         tempPath = getTempFilePath(`online_image_${redirectCount}`)
-        const res = await Plugins.Download(currentUrl, tempPath, headers, undefined, { Timeout: ONLINE_IMAGE_TIMEOUT_SECONDS, Redirect: false })
+        const res = await Plugins.Download(currentUrl, tempPath, headers, undefined, { Timeout: timeoutSeconds, Redirect: false })
         if (isCancelled()) throw new Error('ONLINE_IMPORT_CANCELLED')
 
         const status = res?.status
@@ -3097,13 +3348,11 @@ const destroyUnifiedModals = () => {
 }
 
 const createOnlineImagePreviewController = ({ state, urlInput, previewImage, previewText, info }) => {
-  const release = () => {
-    if (!state.previewObjectUrl) return
-    try {
-      URL.revokeObjectURL(state.previewObjectUrl)
-    } catch {}
-    state.previewObjectUrl = null
-  }
+  /*
+   * 预览走的是远程 URL（previewImage.src = previewUrl），从不创建 Blob URL，
+   * 所以这里没有需要 revoke 的对象 URL；保留 release() 作为统一清理入口（当前为空操作）。
+   */
+  const release = () => {}
 
   const update = () => {
     const rawUrl = urlInput.value.trim()
@@ -3157,7 +3406,13 @@ const runOnlineImageOperation = async ({ state, dom = {}, syncPrimaryButton, lab
   if (disableClose && dom.closeButton) dom.closeButton.disabled = true
   syncPrimaryButton?.()
   try {
-    return await enqueueThemeOperation(operation, { label })
+    return await enqueueThemeOperation(
+      async (ctx) => {
+        await ensureThemeVisualsRestored(ctx)
+        return await operation(ctx)
+      },
+      { label },
+    )
   } finally {
     state.queued = false
     if (saving) state.saving = false
@@ -3620,7 +3875,6 @@ const OnlineImage = async () => {
     saving: false,
     modal: null,
     previewVersion: 0,
-    previewObjectUrl: null,
     previewTimer: null,
     draggedEntryId: null,
     dragOverEntryId: null,
@@ -3813,21 +4067,33 @@ const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = ''
     let resultValue = null
     let confirmBtn = null
     let modal = null
+    /*
+     * cancelModal 是清理段统一调用的 settle 入口：
+     * 即便宿主没派发 afterClose（destroy 直接销毁），也能立即 resolve。
+     */
+    let cancelModal = null
 
     const content = $el('div', `ctm-unified-modal-body${contentClass ? ` ${contentClass}` : ''}`)
     const finish = (value) => {
       if (settled) return
       settled = true
       resultValue = value
+      activeModalCancellers.delete(cancelModal)
       try {
         modal?.close?.()
       } catch {
         try {
           modal?.destroy?.()
         } catch {}
-        resolve(resultValue)
       }
+      /*
+       * 直接 resolve，不依赖 afterClose：
+       * 否则清理段只 destroy 不 close 时，afterClose 可能不派发，
+       * 调用方 await 会永久挂起。afterClose 里仍有 settle 保护（幂等）。
+       */
+      resolve(resultValue)
     }
+    cancelModal = () => finish(null)
 
     const setConfirmEnabled = (enabled) => {
       if (confirmBtn) confirmBtn.disabled = !enabled
@@ -3862,6 +4128,7 @@ const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = ''
         height: String(height || 'auto'),
         afterClose: () => {
           activeUnifiedModals.delete(modal)
+          activeModalCancellers.delete(cancelModal)
           try {
             content.remove()
           } catch {}
@@ -3882,11 +4149,22 @@ const openPickerModal = ({ width, title, subtitle, confirmText, footerStyle = ''
     )
 
     modal.open()
+    activeModalCancellers.add(cancelModal)
     if (typeof built.refresh === 'function') built.refresh()
   })
 const pickPresetBackground = async () => {
+  /*
+   * 进入选择器前的背景快照。
+   *
+   * 卡片 hover / 点击都会就地改 DOM 做预览（applyPresetBackgroundStyle），
+   * 所以取消（含直接关窗）时必须回到这个快照，
+   * 否则预览样式会残留在页面上，表现为「点了取消但背景已经换掉了」。
+   *
+   * 注意：captureBackgroundState() 的返回结构是 { version, styles, objectUrl }，
+   * 不含 backgroundIndex —— 预设索引必须从配置里取。
+   */
   const originalState = captureBackgroundState()
-  let currentIndex = normalizeBackgroundIndex(originalState?.backgroundIndex)
+  let currentIndex = normalizeBackgroundIndex(DEFAULT_CONFIG.backgroundIndex)
   try {
     const config = await getCachedConfig()
     currentIndex = normalizeBackgroundIndex(config.backgroundIndex)
@@ -3996,6 +4274,7 @@ const Select = async () => {
     await enqueueThemeOperation(
       async (ctx) => {
         ctx.assertActive()
+        await ensureThemeVisualsRestored(ctx)
         const config = await getCachedConfig()
         ctx.assertActive()
         const selectedIndex = typeof index === 'number' ? normalizeBackgroundIndex(index) : normalizeBackgroundIndex(config.backgroundIndex)
@@ -4039,6 +4318,7 @@ const ClearImage = () =>
   enqueueThemeOperation(
     async (ctx) => {
       ctx.assertActive()
+      await ensureThemeVisualsRestored(ctx)
       const originalState = captureBackgroundState()
       const config = await getCachedConfig()
       ctx.assertActive()
@@ -4570,18 +4850,29 @@ const CustomCSS = async () => {
 
   const saveCSS = async () => {
     if (finalized || state.saving) return false
+    /*
+     * 【P1 修复】锁必须在任何 await 之前置位。
+     *
+     * 下面有 350ms 的 debounce 等待，锁如果放在等待之后，
+     * 这 350ms 内「保存」按钮仍处于可点状态 ⇒ 连点两次会串行跑两遍保存事务
+     * （两遍都会写 custom.css + 配置，第二次还会顶掉第一次的回读验证）。
+     */
+    state.saving = true
 
     // 等待 CodeEditor 的 300ms change debounce，把最新编辑内容同步到 state。
     await new Promise((resolve) => setTimeout(resolve, 350))
-    if (finalized || state.closed) return false
+    if (finalized || state.closed) {
+      state.saving = false
+      return false
+    }
 
     const css = typeof state.css === 'string' ? state.css : ''
-    state.saving = true
 
     try {
       const operation = enqueueThemeOperation(
         async (ctx) => {
           ctx.assertActive()
+          await ensureThemeVisualsRestored(ctx)
 
           // 语法确认已在进入持久化队列前交给宿主 CodeEditor 完成。
           await saveCustomCSSText(css, state.cssEnabled)
@@ -4686,25 +4977,7 @@ const CustomCSS = async () => {
   }
 }
 
-const applyTheme = () => {
-  const operation = enqueueThemeOperation(
-    async (ctx) => {
-      ctx.assertActive()
-      return await applyThemeInternal(ctx)
-    },
-    { label: 'apply-theme' },
-  )
-  operation.catch((error) => {
-    if (error?.cancelled) return
-    console.error('[CustomTheme] applyTheme failed:', error)
-  })
-  return operation
-}
-const cleanupRuntime = () => {
-  /*
-   * 让所有旧 generation 的异步任务立即失效。
-   */
-  invalidateRuntime()
+const cancelPendingOperations = () => {
   /*
    * 主动结束插件自己持有的文件选择器 Promise。
    * 无法保证立即关闭原生文件对话框，但 JS listener / Promise 会立即收口。
@@ -4716,8 +4989,22 @@ const cleanupRuntime = () => {
   }
   activeFilePickerCancellers.clear()
   /*
-   * 先关闭 Modal。
+   * 主动收口「选择背景 / 选择图标」等统一 Modal 的 Promise。
+   *
+   * 宿主的 afterClose 只在 modal.close() 的正常流程里派发；
+   * 清理段 destroyUnifiedModals() 直接调 modal.destroy?.()，不保证派发 afterClose。
+   * 若只 destroy 而不收口，await openPickerModal(...) 会永久挂起
+   * （开着弹窗时禁用插件 / 重载 APP 尤其明显）。
+   * 这里统一调用 settle（finish(null)），即便宿主没派发 afterClose 也能 resolve。
    */
+  for (const cancelModal of [...activeModalCancellers]) {
+    try {
+      cancelModal()
+    } catch {}
+  }
+  activeModalCancellers.clear()
+}
+const closePluginModals = () => {
   destroyUnifiedModals()
   if (activeCSSModal) {
     try {
@@ -4725,6 +5012,30 @@ const cleanupRuntime = () => {
     } catch {}
     activeCSSModal = null
   }
+}
+/*
+ * cleanupRuntime 分两段，调用方按需选择：
+ *
+ *   收口段（cancelPendingOperations + closePluginModals）：
+ *     在任何实例上执行都无害 —— 新实例里这两个集合本来就是空的。
+ *
+ *   破坏段（invalidateRuntime + clearRuntimeVisualState）：
+ *     只有插件真的要停下来（禁用 / 关闭 / 卸载）才执行。
+ *
+ * 为什么要拆开：on::reload 的派发时机没有文档保证。
+ * 若宿主是在「新实例 onReady 之后」才派发 on::reload，
+ * 破坏段会把刚应用好的主题连同 130+ 个配色变量一起清掉 ⇒
+ * 「APP 重载后主题消失」。
+ * 而重载本身会重建页面，注入的 <style> 随之消失，收口段已经足够。
+ */
+const cleanupRuntime = ({ invalidate = true } = {}) => {
+  cancelPendingOperations()
+  closePluginModals()
+  if (!invalidate) return
+  /*
+   * 让所有旧 generation 的异步任务立即失效。
+   */
+  invalidateRuntime()
   /*
    * 清理插件运行时样式、背景及其 Blob URL。
    */
@@ -4733,15 +5044,37 @@ const cleanupRuntime = () => {
 /* ==
  * Clear
  * == */
-const Clear = () => {
-  /*
-   * 只清理插件运行时资源。
-   *
-   * 不删除 themes.json / custom.css / 图片。
-   * 这是 disable / dispose 使用的。
-   */
-  clearRuntimeVisualState({ clearRootVariables: true })
+/*
+ * 「清除主题」只清理运行时呈现，不动磁盘：
+ * themes.json / custom.css / 背景图片都保留 ⇒ 重启或重新应用后主题会回来。
+ *
+ * 清完之后必须留下标记，否则会退化成「半套主题」：
+ * 只清样式而不记录状态的话，用户接着点「本地图片 / 纯色背景」这类只改背景的菜单，
+ * 背景回来了，但 130+ 个配色变量不会被重新应用 ⇒ 界面配色仍是宿主的。
+ * 有标记之后，任意主题菜单都会先完整应用一次主题（ensureThemeVisualsRestored）。
+ */
+let themeVisualsCleared = false
+const ensureThemeVisualsRestored = async (ctx) => {
+  if (!themeVisualsCleared) return false
+  ctx?.assertActive()
+  await applyThemeInternal(ctx, { refreshDynamicUrl: false })
+  themeVisualsCleared = false
+  return true
 }
+const Clear = () =>
+  enqueueThemeOperation(
+    async (ctx) => {
+      /*
+       * 入队而非直接执行：避免与正在进行的「应用主题」操作发生竞态。
+       * 旧行为直接清样式，若此时队列里还有一个 apply 在后头，
+       * 会出现「清完又被 apply 的样式覆盖 / 覆盖又被清」的闪烁与半套主题。
+       */
+      clearRuntimeVisualState({ clearRootVariables: true })
+      themeVisualsCleared = true
+      Plugins.message.info('已清除主题运行时样式；下次使用任意主题菜单会自动重新应用（要彻底重置请用「重置配置」）', 2800)
+    },
+    { label: 'Clear' },
+  )
 const resetThemeInternal = async () => {
   const currentConfig = await getCachedConfig()
   const config = normalizeConfig({
@@ -4920,9 +5253,7 @@ const pickIconOption = (entries) =>
       return { body: list, refresh, getSelection: () => selectedId }
     },
   )
-const resolveIconRepoPath = (iconId, name) => {
-  return `${ICON_REPO_DIR}/${iconId}/${name}.ico`
-}
+const resolveIconRepoPath = (iconId, name) => getIconSetSourcePath(iconId, name)
 // 优化后的CustomIcon函数（关键部分）
 const CustomIcon = async () => {
   const generation = runtimeGeneration
@@ -5029,9 +5360,9 @@ const CustomIcon = async () => {
    * Modal 在 Queue 外面。
    */
   // 显示选择界面
-  checkRuntime('pickIconOption')
+  checkRuntime('pickIconOption', generation)
   const iconId = await pickIconOption(entries)
-  checkRuntime('pickIconOption')
+  checkRuntime('pickIconOption', generation)
 
   if (iconId === null || iconId === undefined) {
     return false
@@ -5048,6 +5379,7 @@ const CustomIcon = async () => {
   const operation = enqueueThemeOperation(
     async (ctx) => {
       ctx.assertActive()
+      await ensureThemeVisualsRestored(ctx)
       await cleanupIconTempFiles()
       await purgeLegacyFiles()
       const selectedIcon = iconMap[iconId]
@@ -5058,6 +5390,10 @@ const CustomIcon = async () => {
         } else {
           Plugins.message.success(`已恢复默认图标（${restored.length} 个）`, 1500)
         }
+        /*
+         * 已经回到原厂图标 ⇒ 清空记录，启动自检不再尝试自愈。
+         */
+        await saveActiveIconId('')
         return {
           installed: true,
           refreshed: false,
@@ -5162,6 +5498,11 @@ const CustomIcon = async () => {
             version: BACKGROUND_TX_VERSION,
           },
         )
+        /*
+         * 事务提交成功后才记录 iconId：
+         * 提前记录会让启动自检去自愈一套并未真正装上的图标。
+         */
+        await saveActiveIconId(iconId)
         return {
           installed: true,
           refreshed: false,
@@ -5231,14 +5572,170 @@ const getCurrentThemeMode = () => {
   const mode = document.body?.getAttribute('theme-mode')
   return mode === 'dark' ? 'dark' : 'light'
 }
-const getCurrentTrayIconPath = () => {
+/*
+ * 托盘图标是三态的，与宿主前端完全同构：
+ *
+ *   宿主刷新托盘时的选图逻辑（宿主前端产物内实测）是
+ *     data/.cache/{icons|imgs}/tray_normal_{themeMode}.{ico|png}
+ *     kernel.running && config.tun.enable            -> tray_tun
+ *     : kernel.running && env.systemProxy            -> tray_proxy
+ *     :                                                 tray_normal
+ *
+ *   插件刷新托盘时如果固定写死 tray_normal，就会在 TUN / 系统代理模式下
+ *   把状态图标刷成「普通」图标，直到宿主下一次自己刷新才恢复 ——
+ *   这就是「换图标后托盘变了，但图标是 tray_normal.ico」的根因。
+ */
+/*
+ * 回退优先级：normal 是最通用的兜底（它不隐含任何运行态），
+ * 所以 detected 缺失时先退 normal，再退其它状态。
+ */
+const TRAY_ICON_FALLBACK_ORDER = ['normal', 'tun', 'proxy']
+const KERNEL_RUNNING_CONFIG_FILE = 'data/sing-box/config.json'
+/*
+ * FileExists 的返回类型在不同宿主版本上不一致（布尔 / 字符串 "false"），
+ * 这里只在托盘回退这条新路径上做严格判定，不动其它既有调用点。
+ */
+const fileExistsStrict = async (path) => {
+  try {
+    const res = await Plugins.FileExists(path)
+    if (res === false || res === 'false') return false
+    if (res === true || res === 'true') return true
+    return Boolean(res)
+  } catch {
+    return false
+  }
+}
+/*
+ * 运行中的 sing-box 配置由宿主写入，是「当前是否 TUN」最权威的来源：
+ * 宿主开启 TUN 时配置里必然存在 type === 'tun' 的 inbound（或顶层 tun.enable）。
+ */
+const readKernelTunEnabled = async () => {
+  try {
+    const raw = await Plugins.ReadFile(KERNEL_RUNNING_CONFIG_FILE)
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+    if (Array.isArray(parsed?.inbounds)) {
+      return parsed.inbounds.some((item) => item && item.type === 'tun')
+    }
+    return parsed?.tun?.enable === true
+  } catch (error) {
+    console.warn('[CustomIcon] 读取内核运行配置失败，按非 TUN 处理:', errText(error))
+    return false
+  }
+}
+/*
+ * 系统代理状态没有插件侧 API，只能读宿主 bridge：window.go.bridge.App.GetSystemProxy()。
+ *
+ * ★ 返回值形态（宿主产物实测，updateSystemProxyStatus）：
+ *   GetSystemProxy() 返回的不是 { enable } 对象，而是**当前系统代理地址字符串**；
+ *   宿主拿它跟本应用代理端点做 includes 比对，命中才算「系统代理已开启」。
+ *   patch4 按对象字段解析 ⇒ 恒为 false ⇒ 静默退回 normal，一行日志都没有。
+ *
+ * 这里同样做端点比对，而不是「非空即启用」：
+ *   只判断非空会把用户自己设的其它代理也算成托盘 proxy 图标。
+ */
+const unwrapBridgeResult = (res) => {
+  if (res && typeof res === 'object' && 'flag' in res) return res.flag ? res.data : null
+  return res
+}
+const normalizeListenHost = (host) => {
+  const value = String(host ?? '').trim()
+  if (!value || ['0.0.0.0', '::', '[::]', '*'].includes(value)) return '127.0.0.1'
+  return value
+}
+/*
+ * 本应用的代理端点来自宿主写入的运行配置（mixed 优先，其次 http / socks）。
+ */
+const readKernelProxyEndpoint = async () => {
+  try {
+    const raw = await Plugins.ReadFile(KERNEL_RUNNING_CONFIG_FILE)
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+    const inbounds = Array.isArray(parsed?.inbounds) ? parsed.inbounds : []
+    for (const type of ['mixed', 'http', 'socks']) {
+      const inbound = inbounds.find((item) => item && item.type === type)
+      const port = Number(inbound?.listen_port)
+      if (!Number.isFinite(port) || port <= 0) continue
+      return { host: normalizeListenHost(inbound.listen), port, type }
+    }
+    return null
+  } catch (error) {
+    console.warn('[CustomIcon] 读取内核代理端点失败:', errText(error))
+    return null
+  }
+}
+const readHostSystemProxyAddress = async () => {
+  const bridge = typeof window !== 'undefined' ? window?.go?.bridge?.App : null
+  if (!bridge || typeof bridge.GetSystemProxy !== 'function') {
+    console.warn('[CustomIcon] 宿主 bridge 不可用（缺 window.go.bridge.App.GetSystemProxy），按未开启系统代理处理')
+    return ''
+  }
+  const data = unwrapBridgeResult(await bridge.GetSystemProxy())
+  if (typeof data === 'string') return data.trim()
+  if (data && typeof data === 'object') {
+    return String(data.server ?? data.Server ?? data.address ?? data.Address ?? data.host ?? '').trim()
+  }
+  return ''
+}
+const readHostSystemProxyEnabled = async () => {
+  try {
+    const address = await readHostSystemProxyAddress()
+    if (!address) return false
+    const endpoint = await readKernelProxyEndpoint()
+    if (!endpoint) {
+      console.warn('[CustomIcon] 系统代理地址非空但读不到内核端点，按未开启处理:', address)
+      return false
+    }
+    const matched = [`${endpoint.host}:${endpoint.port}`, `127.0.0.1:${endpoint.port}`, `localhost:${endpoint.port}`].some((item) => address.includes(item))
+    if (!matched) console.warn(`[CustomIcon] 系统代理地址未指向本应用：${address} ≠ ${endpoint.host}:${endpoint.port}`)
+    return matched
+  } catch (error) {
+    console.warn('[CustomIcon] 读取系统代理状态失败，按未开启处理:', errText(error))
+    return false
+  }
+}
+const detectTrayIconState = async () => {
+  if (await readKernelTunEnabled()) return 'tun'
+  let address = ''
+  try {
+    address = await readHostSystemProxyAddress()
+  } catch (error) {
+    console.warn('[CustomIcon] 读取系统代理地址异常:', errText(error))
+  }
+  if (address && (await readHostSystemProxyEnabled())) return 'proxy'
+  if (!address) {
+    console.debug('[CustomIcon] 托盘状态=normal：TUN 未启用，系统代理未开启（GetSystemProxy 返回空）')
+  } else {
+    console.debug(`[CustomIcon] 托盘状态=normal：TUN 未启用，系统代理地址 ${address} 未匹配本应用内核端点（见上方 warn）`)
+  }
+  return 'normal'
+}
+const getTrayIconPath = (state, mode) => `${ICON_CACHE_DIR}/tray_${state}_${mode}${ICON_EXT}`
+/*
+ * 目标状态图标缺失（图标集只装了部分 / 缓存被清）时逐级回退，
+ * 保证 UpdateTray 一定拿到存在的文件：
+ * 刷新失败会误导用户去点「重启客户端」，而重启其实也解决不了缺文件。
+ */
+const resolveTrayIconPath = async () => {
   const mode = getCurrentThemeMode()
-  return `${ICON_CACHE_DIR}/` + `tray_normal_${mode}${ICON_EXT}`
+  const detected = await detectTrayIconState()
+  const order = [detected, ...TRAY_ICON_FALLBACK_ORDER.filter((item) => item !== detected)]
+  for (const state of order) {
+    const iconPath = getTrayIconPath(state, mode)
+    if (await fileExistsStrict(iconPath)) {
+      if (state !== detected) console.warn(`[CustomIcon] 托盘状态图标 ${detected} 缺失，回退 ${state}`)
+      return { iconPath, state, detected, missing: false }
+    }
+  }
+  return { iconPath: getTrayIconPath(detected, mode), state: detected, detected, missing: true }
 }
 const refreshTrayIcon = async () => {
-  const iconPath = getCurrentTrayIconPath()
-  if (!(await Plugins.FileExists(iconPath))) {
-    throw new Error(`托盘图标不存在：${iconPath}`)
+  const { iconPath, missing, detected } = await resolveTrayIconPath()
+  /*
+   * 这行日志是「新代码到底有没有在跑」的自证：
+   * Plugin 是加载时快照，改完文件必须重启 App；没看到这一行就说明跑的还是旧版。
+   */
+  console.warn(`[CustomIcon] 托盘刷新[v11.7-patch7]: 状态=${detected} 图标=${iconPath}`)
+  if (missing) {
+    throw new Error(`托盘图标不存在：${iconPath}（当前状态 ${detected}）`)
   }
   if (typeof Plugins.UpdateTray !== 'function') {
     throw new Error('宿主不支持 UpdateTray')
@@ -5256,6 +5753,7 @@ const enqueueThemeLifecycle = ({ label, errorMessage, prepare, applyOptions, suc
       if (prepare) await prepare(ctx)
       ctx.assertActive()
       const result = await applyThemeInternal(ctx, applyOptions)
+      themeVisualsCleared = false
       if (successMessage && ctx.isActive()) Plugins.message.success(successMessage, 1200)
       return result ?? 0
     },
@@ -5279,9 +5777,12 @@ const onInstall = () =>
       const exists = await Plugins.FileExists(THEME_FILE)
       if (!exists) await saveConfig(DEFAULT_CONFIG)
       ctx.assertActive()
-      await ensureFactoryIconBackup()
+      /*
+       * 原厂图标备份已由 startup() → bootstrapIcons() 负责，
+       * 这里不再重复调用：重复备份会把「已安装的自选图标」误当成原厂图标。
+       */
     },
-    applyOptions: { refreshDynamicUrl: true },
+    applyOptions: { refreshDynamicUrl: true, startupRefresh: true },
   })
 let uninstalling = false
 const onUninstall = async () => {
@@ -5311,9 +5812,11 @@ const onUninstall = async () => {
     /*
      * Queue 已经收口以后，再删除文件。
      */
-    const removed = await runUninstallCleanup()
+    const { removed, pending } = await runUninstallCleanup()
     if (removed) {
       Plugins.message.success('卸载清理完成', 1500)
+    } else if (pending.length) {
+      Plugins.message.warn(`有 ${pending.length} 个图标缺少原厂备份，已保留插件目录以便重建，请重新选择图标后再清理`, 6000)
     } else {
       Plugins.message.warn('插件运行时已清理，但插件目录删除失败，请稍后手动清理', 2600)
     }
@@ -5327,14 +5830,27 @@ const onUninstall = async () => {
   }
 }
 const runUninstallCleanup = async () => {
+  let pending = []
   try {
-    await resetOwnedIcons()
+    const result = await resetOwnedIcons()
+    pending = Array.isArray(result?.pending) ? result.pending : []
   } catch (error) {
     console.error('[CustomTheme] 恢复默认图标失败:', error)
     throw error
   }
   await cleanupIconTempFiles()
   await cleanupPluginTempFiles()
+  /*
+   * resetOwnedIcons 在缺少原厂备份时只会删掉线上图标并把路径记进 pending，
+   * 也就是说这些图标此时已经无法还原。
+   *
+   * icons/original 是唯一可用于重建的来源，而它就位于 PATH 之内，
+   * 因此只要 pending 非空就必须保留插件目录，否则备份和图标一起消失。
+   */
+  if (pending.length) {
+    console.warn(`[CustomTheme] 卸载清理：${pending.length} 个图标缺少原厂备份，保留插件目录`, pending)
+    return { removed: false, pending }
+  }
   let removed = true
   try {
     await Plugins.RemoveFile(PATH)
@@ -5342,14 +5858,14 @@ const runUninstallCleanup = async () => {
     removed = false
     console.warn('[CustomTheme] 删除插件目录失败:', error)
   }
-  return removed
+  return { removed, pending }
 }
 const onReady = () =>
   enqueueThemeLifecycle({
     label: 'onReady',
     errorMessage: '主题初始化失败',
     prepare: startup,
-    applyOptions: { refreshDynamicUrl: true },
+    applyOptions: { refreshDynamicUrl: true, startupRefresh: true },
   })
 const onRun = () =>
   enqueueThemeLifecycle({
@@ -5357,9 +5873,9 @@ const onRun = () =>
     errorMessage: '主题应用失败',
     successMessage: '主题已生效',
   })
-const handleLifecycleCleanup = (functionName) => {
+const handleLifecycleCleanup = (functionName, options = {}) => {
   try {
-    cleanupRuntime()
+    cleanupRuntime(options)
   } catch (error) {
     console.warn(`[CustomTheme] ${functionName} 清理失败:`, error)
   }
@@ -5368,7 +5884,26 @@ const handleLifecycleCleanup = (functionName) => {
 
 const onDisabled = () => handleLifecycleCleanup('onDisabled')
 const onDispose = () => handleLifecycleCleanup('onDispose')
-const onReload = () => handleLifecycleCleanup('onReload')
+/*
+ * on::reload 只做收口，不做破坏性清理：
+ * 理由见 cleanupRuntime 的注释 —— 派发时机未保证，清了就可能把新实例刚应用好的主题抹掉。
+ */
+const onReload = () => handleLifecycleCleanup('onReload', { invalidate: false })
+/*
+ * onEnabled 不经过 triggers 白名单门控，宿主在「重新启用」时一定会调用。
+ *
+ * 缺了它会怎样：onDisabled 把 runtimeActive 置为 false，
+ * 重新启用时若宿主不再派发 ready / manual（手动点「运行」之外没有别的入口），
+ * 8 个菜单会全部在 checkRuntime / ctx.assertActive() 上抛 OPERATION_CANCELLED
+ * —— 现象是「点了没反应，控制台也不报错」。
+ */
+const onEnabled = () =>
+  enqueueThemeLifecycle({
+    label: 'onEnabled',
+    errorMessage: '主题恢复失败',
+    prepare: startup,
+    successMessage: '主题已恢复',
+  })
 const onConfigure = () => {
   ensureThemeModalStyle()
   try {

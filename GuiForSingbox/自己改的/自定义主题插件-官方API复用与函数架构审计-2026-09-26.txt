@@ -1,0 +1,646 @@
+GUI.for.SingBox 自定义主题插件
+官方 API 复用与函数架构审计
+日期：2026-09-26
+
+一、审计对象
+
+本次审计以当前工作文件：
+v11.7-patch1-动态背景版-在线图片与URL动态背景逻辑修复-最终版.txt
+为基准，同时对照：
+1. GUI-for-Cores/GUI.for.SingBox
+2. GUI-for-Cores/Plugin-Hub
+3. Plugin-Hub 当前 plugins.d.ts
+4. Plugin-Hub 现有 Generic/plugin-custom-theme.js、GFS/plugin-config-override.js 等实际插件用法
+
+目标不是简单“删函数”，而是建立一个原则：
+“宿主/插件生态已经提供的能力直接调用；只有业务语义、事务、安全校验、主题运行时等不存在的能力才由插件自己实现。”
+
+二、核心结论
+
+当前代码整体功能架构已经可以工作，但维护成本偏高，主要原因不是某一个函数特别复杂，而是存在三个层次混在一起：
+
+A. 官方基础能力
+Modal、Picker、文件 IO、下载、HTTP、消息、系统托盘、重启、环境/Store、通用工具。
+这些应该尽量直接调用 Plugins.*。
+
+B. 插件业务能力
+主题配置、预设背景、URL 背景库、加权随机、动态背景缓存、CSS、图标管理。
+这些官方没有，需要自己实现。
+
+C. 插件基础设施
+操作串行队列、运行时取消、原子文件事务、恢复日志、图片格式魔数检测、SSRF 防护。
+这些也不是官方已有的直接替代品，因此可以保留自研。
+
+当前最值得处理的不是继续增加功能，而是：
+1. 把所有 backgroundUrls 的写操作统一串进 enqueueThemeOperation()；
+2. 去掉明显只是“官方函数再包一层”的重复函数；
+3. 用 Plugins.picker.single() 替换预设背景自定义 Picker Modal；
+4. 清理明确无调用的旧函数；
+5. 修正动态背景预览、URL 请求重定向、缓存一致性几个边界问题。
+
+三、官方已经提供、建议直接使用的能力
+
+1. Modal
+
+官方：Plugins.modal()
+官方返回对象已经有：
+- open()
+- close()
+- destroy()
+- setProps()
+- patchProps()
+- setSlots()
+- patchSlots()
+- setComponent()
+- setContent()
+
+因此当前插件的 createUnifiedModal() 可以保留，作为“统一默认参数”的薄封装；但是不要再额外实现一套 Modal 生命周期机制去替代官方 Modal。
+
+当前文件中：
+- createUnifiedModal()：可以保留
+- modal.close()：正确，应继续使用
+- destroyUnifiedModals()：作为插件自己的 Modal 注册表，可以保留
+
+官方 GUI.for.SingBox 的 Modal 默认 maskClosable=false，同时支持 px/py、toolbar、beforeClose、afterClose 等配置；当前插件的“点击遮罩不关闭”需求可以直接依赖官方能力。
+
+2. 官方 Picker
+
+官方提供：
+Plugins.picker.single()
+Plugins.picker.multi()
+
+single() 的选项已经支持：
+- label
+- value
+- description
+- background
+- onSelect
+
+而官方 Plugin-Hub 自己的 Generic/plugin-custom-theme.js 就已经用 Plugins.picker.single() 实现“预设背景选择 + background 色块预览 + onSelect 实时预览”。
+
+因此当前插件：
+- openPickerModal()：对于“预设背景”属于重复造轮子
+- pickPresetBackground()：应改为 Plugins.picker.single()
+
+但是 icon picker 与预设背景不同：一行里存在多张图标预览、下载/应用逻辑，官方 Picker 没有等价的多图片复杂行布局，因此 icon picker 可以继续使用自定义 Modal。
+
+3. 文件系统 API
+
+官方已经提供：
+- Plugins.OpenDir
+- Plugins.OpenURI
+- Plugins.AbsolutePath
+- Plugins.CopyFile
+- Plugins.MakeDir
+- Plugins.ReadDir
+- Plugins.FileExists
+- Plugins.FileSHA256
+- Plugins.RemoveFile
+- Plugins.MoveFile
+- Plugins.ReadFile
+- Plugins.WriteFile
+
+当前插件已经大量正确使用这些函数。
+
+明确可以简化：
+- fileExists(path) => 直接使用 Plugins.FileExists(path)
+
+fileExists() 只是官方函数的一层同名代理，没有增加语义，也没有统一错误处理，因此建议删除。
+
+getDirEntries() 不建议删除。它虽然调用官方 ReadDir，但它增加了“目录不存在/读取失败时返回空数组”的业务语义，适合清理/恢复流程。
+
+safeRemoveFile() 也不建议删除。它增加了“删除失败只告警、不让清理流程继续失败”的语义，属于合理的业务封装。
+
+removeFileOrThrow() 可以保留，但应检查调用场景；它与 safeRemoveFile() 是“宽松删除”和“严格删除”的两种明确语义，而不是纯代理。
+
+4. 下载与 HTTP
+
+官方已经提供：
+- Plugins.Download()
+- Plugins.HttpGet()
+- Plugins.HttpHead()
+- Plugins.HttpPost()
+- Plugins.HttpPut()
+- Plugins.HttpDelete()
+- Plugins.HttpPatch()
+- Plugins.Requests()
+- Plugins.HttpCancel()
+- Plugins.GetRequestProxy()
+
+当前在线图片实际下载使用 Plugins.Download()，这是正确方向，不应自己再通过 fetch/XHR 实现宿主文件下载。
+
+图标代码当前使用 Plugins.HttpHead()，也可以继续直接使用。
+
+5. 通用工具
+
+Plugin-Hub 当前已经提供：
+- Plugins.sampleID()
+- Plugins.deepClone()
+- Plugins.deepAssign()
+- Plugins.isValidBase64()
+- Plugins.isValidIPv4()
+- Plugins.isValidIPv6()
+- Plugins.isValidIPCIDR()
+- Plugins.isValidJson()
+- Plugins.debounce()
+- Plugins.throttle()
+- Plugins.asyncPool()
+- Plugins.createAsyncPool()
+- Plugins.sleep()
+- Plugins.ignoredError()
+- ClipboardSetText()/ClipboardGetText()
+
+当前代码可以直接替换：
+createBackgroundUrlId()
+当前是：Date.now()+Math.random()
+
+建议：
+const createBackgroundUrlId = () => Plugins.sampleID()
+
+这样 ID 生成标准统一，也减少自己维护随机 ID 的责任。
+
+但缓存文件名仍然可以保留自己的安全字符约束，不要把 ID 合法性和文件名合法性混成一件事。
+
+四、必须自己实现、不能为了“官方化”而删除的能力
+
+1. normalizeBackgroundUrls()
+
+这是插件的数据模型归一化，不是官方通用 API 能替代的。
+它负责：
+- URL trim
+- ID 去重
+- URL 去重
+- enabled 默认值
+- weight 归一化
+- cachePath 合法性
+
+保留。
+
+2. normalizeBackgroundUrlWeight()
+
+权重范围 1～10 是插件自己的业务规则，保留。
+
+3. getEnabledBackgroundUrls()
+
+“哪些 URL 进入动态随机池”属于插件业务，保留。
+
+4. pickWeightedBackgroundUrl()
+
+官方 asyncPool 等函数不能替代“按业务权重随机选一个候选”，保留。
+
+5. refreshDynamicUrlBackgroundEntry()
+
+它承担：
+- 实际请求 URL
+- 请求阶段地址检查
+- 下载图片
+- 文件类型识别
+- 写本地缓存
+- 更新 cachePath
+- 应用背景
+
+属于插件业务核心，保留。
+
+6. applyDynamicBackground()
+
+它负责：
+- 按权重随机
+- 失败后按剩余候选继续
+- 有缓存时回退缓存
+- 全部失败后交给普通背景回退
+
+这是当前插件的核心策略，官方没有等价 API，保留。
+
+7. atomicWriteFile() / atomicMoveFile()
+
+官方提供 MoveFile/CopyFile，但没有提供本插件所需的“写 .new -> 备份 .bak -> 替换 -> 回滚”的完整事务抽象。
+
+因此这些不能简单改成 Plugins.WriteFile 后删除。
+
+8. executeBackgroundTransaction() 等恢复事务函数
+
+官方没有提供跨多个文件的事务/Journaling/Crash Recovery 能力。
+如果继续要求“插件崩溃/强退后下一次启动恢复”，这些逻辑必须自研。
+
+9. detectImageFormat()
+
+官方没有“图片魔数检测 + 返回扩展名/MIME”的 API。
+它负责防止扩展名伪装，因此保留。
+
+10. validateImageUrl()/isBlockedHost()/IPv4/IPv6 私网判断
+
+Plugin-Hub 虽然提供 isValidIPv4()/isValidIPv6()，但这两个只是地址语法验证，不能替代：
+- localhost
+- loopback
+- private IPv4
+- link-local
+- IPv4 mapped IPv6
+- 内网网段
+- 本机地址等 SSRF 规则
+
+因此当前安全判断仍应自研。
+
+可以考虑在 canonical IPv4/IPv6 的语法部分调用官方 API，但不能把整个 isBlockedHost() 删除。
+
+11. openImageFilePicker()
+
+目前没有找到宿主正式对插件开放的“选择本地文件”通用 API；Plugin-Hub 自身也大量采用 document.createElement('input') + type=file 的方式。
+
+因此当前自定义文件选择器可以保留。
+
+12. setVariable()/setCustomCSS()/clearCustomCSS()/applyBackgroundObjectUrl()
+
+这些都是主题插件自己的 DOM 运行时职责，官方没有等价能力，保留。
+
+五、当前明确存在的问题
+
+P0-1：backgroundUrls 的写操作没有全部进入同一串行队列
+
+当前：
+- enabled.onchange -> 直接 saveConfig()
+- weight.onchange -> 直接 saveConfig()
+- globalToggle.onchange -> 先 saveConfig()，再 enqueueThemeOperation()
+- addEntry() 新 URL -> 在 queue 中保存
+- deleteEntry() -> 通过 queue
+- 动态刷新 -> queue 中执行
+
+这会造成同一个 singbox-themes.json 同时存在“队列写”和“直接写”的两条路径。
+
+这是当前最应该修复的问题。
+
+正确架构：
+所有对以下字段的修改都必须通过同一个 queue：
+- backgroundUrlEnabled
+- backgroundUrls
+- customBackground
+- backgroundIndex
+
+也就是说：
+UI Event -> enqueueThemeOperation() -> getCachedConfig() -> 修改 -> saveConfig()/事务 -> apply
+
+不要：
+UI Event -> saveConfig()
+然后再 UI Event -> enqueueThemeOperation()
+
+P0-2：动态 URL 新增前后两个阶段的职责必须严格分离
+
+当前目标应该是：
+新增阶段：
+- 只要求非空
+- 不下载
+- 不做图片格式检测
+- 不做网络可达性检测
+- 不做 URL 主机安全校验
+
+应用阶段：
+- 才执行真实请求
+- 才做安全校验
+- 才做图片魔数校验
+- 才产生本地缓存
+
+这套分层是对的，应继续保持。
+
+P0-3：当前预览给 URL 强行追加 _ctm_preview 查询参数存在兼容性问题
+
+当前：
+new URL(rawUrl)
+parsed.searchParams.set('_ctm_preview', ...)
+
+一些带签名参数的 CDN/图片 URL 可能对 query 进行签名；此时额外增加参数可能导致预览失败，甚至让用户误认为 URL 无效。
+
+建议：
+预览尽量使用原始 URL，不修改 query。
+预览是 UI 辅助能力，不能改变用户实际 URL。
+
+P0-4：重定向安全边界仍需重新确认
+
+当前初始 URL 会经过 validateImageUrl()，但真正下载由 Plugins.Download() 完成。
+如果宿主请求层自动跟随重定向，那么“公网 URL -> 302 -> 私网地址”的安全边界不能仅靠第一次 URL 校验保证。
+
+当前代码自己已经留下注释说明这一点，但还没有形成完整解决方案。
+
+后续应该优先确认宿主 Download 的 Redirect 语义，然后决定：
+- 禁止自动重定向；或者
+- 每次重定向都做安全检查；或者
+- 接受宿主统一网络安全策略。
+
+在没有确认前，不建议继续增加复杂的 JS 重定向模拟器。
+
+P1-1：createBackgroundUrlId() 重复造轮子
+
+当前文件：约第 277 行。
+
+改为 Plugins.sampleID()。
+
+P1-2：fileExists() 重复造轮子
+
+当前文件：约第 425 行。
+
+删除封装，直接使用 Plugins.FileExists()。
+
+P1-3：pickPresetBackground() + openPickerModal() 对预设背景属于重复 UI 实现
+
+官方 Picker 已经支持 background + onSelect，官方 custom-theme 自己就是如此实现。
+
+建议：
+预设背景 -> Plugins.picker.single()
+自定义复杂图标 Picker -> 继续自研 Modal
+
+这样可以明显减少插件 UI 代码。
+
+P1-4：明确死代码
+
+当前能直接确认没有任何调用的是：
+- describeNetworkError()，约第 2242 行
+- importOnlineImage()，约第 2295 行
+
+这两个建议删除。
+
+NETWORK_ERROR_RULES() 是否保留取决于是否重新接回错误描述；如果不再使用 describeNetworkError()，NETWORK_ERROR_RULES 也一起删除。
+
+P1-5：URL 去重比较标准不统一
+
+normalizeBackgroundUrls() 使用 lower-case URL key 去重。
+但 OnlineImage 当前新增时使用：
+item.url === rawValue
+
+这可能导致：
+HTTP://A
+http://a
+在 UI 新增判断中不是重复，但保存归一化时又被视为重复。
+
+建议统一定义：
+normalizeBackgroundUrlKey(url)
+
+然后所有去重、已有 URL 查找统一使用它。
+
+P1-6：动态模式下的“启用/禁用单条 URL”和“应用背景”概念要彻底分开
+
+单条 enabled：只控制是否进入随机池。
+weight：只控制随机概率。
+
+两者修改时不应该自动发网络请求。
+
+即时应用只能发生在：
+- 新 URL：添加并应用
+- 已有 URL：应用此 URL
+- 空输入：随机换图
+- 软件启动/重新开启动态背景：动态刷新
+
+这条边界清楚以后，逻辑会简单很多。
+
+P1-7：globalToggle.onchange 当前先保存配置再进入 queue
+
+这是 P0-1 的具体表现。
+
+应改成一个 queue 操作内部完成：
+1. 读取最新 config
+2. 计算 nextConfig
+3. 保存 config
+4. 应用动态/普通背景
+5. 成功后更新 UI
+6. 失败时在同一操作中恢复必要状态
+
+P1-8：enabled.onchange / weight.onchange 当前直接写配置
+
+与上述完全相同，应统一进入 queue。
+
+P1-9：activeBackgroundUrlId 只保存内存状态是合理的
+
+它不应该写入配置。
+启动时 refreshDynamicUrl=true，重新按照权重随机。
+当前设计方向正确。
+
+六、URL 动态背景最终推荐状态机
+
+状态：普通模式
+
+输入：
+- 有 URL -> 导入图片
+- 无 URL -> 主按钮禁用
+
+导入成功：
+下载 -> 文件格式检测 -> 保存 custom_bg -> backgroundUrlEnabled=false -> apply -> 关闭 Modal
+
+状态：URL 动态背景模式
+
+情况 A：输入新 URL
+
+1. 只检查是否为空
+2. 创建 entry
+3. 加入 backgroundUrls
+4. 保证 enabled=true
+5. 保存
+6. 立即请求该 entry
+7. 成功 -> 缓存 + 应用
+8. 失败且已有缓存 -> 使用缓存
+9. 失败且无缓存 -> URL 仍保留在库中，并提示本次应用失败
+
+情况 B：输入已有 URL
+
+1. 不新增
+2. 如果当前 entry 是 disabled，可恢复 enabled=true
+3. 立即请求该 URL
+4. 成功 -> 设为当前背景
+5. 失败 -> 使用自己的 cachePath
+
+情况 C：不输入 URL + 库里有 enabled URL
+
+点击主按钮：
+按 weight 随机 -> 请求 -> 缓存/应用 -> 失败继续剩余候选
+
+情况 D：不输入 URL + 没有 enabled URL
+
+主按钮禁用。
+
+情况 E：开启全局动态背景
+
+1. backgroundUrlEnabled=true
+2. 有候选 -> 立即 refreshDynamicUrl
+3. 没候选 -> 允许保持开启，但不改变当前背景
+
+情况 F：关闭全局动态背景
+
+1. backgroundUrlEnabled=false
+2. activeBackgroundUrlId=null
+3. applyThemeInternal()
+4. 优先 customBackground
+5. 再回退 preset
+
+情况 G：软件启动
+
+onReady/onInstall：
+startup -> applyThemeInternal({ refreshDynamicUrl:true })
+
+动态模式开启时重新随机请求。
+
+七、函数架构推荐
+
+第一层：官方基础 API
+
+只使用 Plugins.*：
+- FileExists
+- ReadDir
+- ReadFile
+- WriteFile
+- CopyFile
+- MoveFile
+- RemoveFile
+- MakeDir
+- Download
+- HttpHead
+- GetRequestProxy
+- modal
+- picker.single
+- confirm
+- message
+- sampleID
+- UpdateTray
+- RestartApp
+
+第二层：插件很薄的语义封装
+
+可以保留：
+- getDirEntries
+- safeRemoveFile
+- removeFileOrThrow
+- createUnifiedModal
+- confirmDialog
+
+这些必须有明确业务语义，不能随意继续增加。
+
+第三层：真正业务函数
+
+配置：
+- normalizeConfig
+- normalizeBackgroundUrls
+- normalizeBackgroundUrlWeight
+- getCachedConfig
+- saveConfig
+
+动态背景：
+- getEnabledBackgroundUrls
+- pickWeightedBackgroundUrl
+- refreshDynamicUrlBackgroundEntry
+- tryCachedBackgroundUrlEntry
+- applyDynamicBackground
+- setBackground
+
+主题：
+- setVariable
+- applyPresetBackground
+- applyThemeInternal
+- setCustomCSS
+- clearCustomCSS
+
+第四层：插件基础设施
+
+- enqueueThemeOperation
+- runtimeGeneration / checkRuntime
+- atomicWriteFile
+- atomicMoveFile
+- executeBackgroundTransaction
+- recovery
+- detectImageFormat
+- SSRF 地址检查
+
+这一层是插件最有价值的自研代码，不应该为了“官方化”而硬删。
+
+八、建议下一版删除/替换清单
+
+直接替换：
+1. createBackgroundUrlId -> Plugins.sampleID
+2. fileExists -> Plugins.FileExists
+3. pickPresetBackground -> Plugins.picker.single
+
+删除：
+4. describeNetworkError
+5. importOnlineImage
+6. 如果不再使用 NETWORK_ERROR_RULES，则一起删除
+
+保留：
+7. getDirEntries
+8. safeRemoveFile
+9. removeFileOrThrow
+10. openPickerModal（仅用于复杂 icon picker）
+11. 所有事务/恢复/图片魔数/SSRF/动态背景策略函数
+
+九、最值得重构的地方
+
+不是继续增加更多小函数，而是把“所有背景状态变化”收口成两个入口：
+
+入口 A：配置状态变化
+
+updateBackgroundConfig(mutator)
+
+负责：
+- 读取最新 config
+- 归一化
+- queue
+- saveConfig
+- 更新缓存
+
+入口 B：背景实际应用
+
+applyBackgroundState(options)
+
+负责：
+- dynamic URL
+- customBackground
+- preset
+- activeBackgroundUrlId
+
+这样 UI 层不再自己决定什么时候直接 saveConfig、什么时候 enqueue、什么时候 apply。
+
+当前 OnlineImage、Select、ClearImage、Reset 等都会因此明显变短。
+
+十、最终维护原则
+
+原则 1：官方 API 是底座，插件不要重写。
+
+原则 2：业务规则必须留在插件自己手里。
+
+原则 3：所有配置写入必须串行。
+
+原则 4：网络下载与 UI 预览必须分离。
+
+原则 5：URL 入库不做验证，URL 实际请求才做安全和图片检查。
+
+原则 6：缓存是运行时加速，不是配置真相；配置里的 URL/weight/enabled 才是持久真相。
+
+原则 7：activeBackgroundUrlId 是会话状态，不持久化。
+
+原则 8：官方 Picker 能解决的问题不要再造 Modal。
+
+原则 9：官方基础函数的包装必须增加明确语义，否则删除。
+
+原则 10：事务、恢复、安全、图片魔数这些宿主没有提供的能力才是插件自己值得维护的代码。
+
+十一、官方源码依据
+
+GUI.for.SingBox Modal：
+https://github.com/GUI-for-Cores/GUI.for.SingBox/blob/main/frontend/src/components/Modal/index.vue
+
+Plugin-Hub API Contract：
+https://github.com/GUI-for-Cores/Plugin-Hub/blob/main/plugins.d.ts
+
+官方 Generic Custom Theme：
+https://github.com/GUI-for-Cores/Plugin-Hub/blob/main/plugins/Generic/plugin-custom-theme.js
+
+Plugin-Hub 配置覆盖示例：
+https://github.com/GUI-for-Cores/Plugin-Hub/blob/main/plugins/GFS/plugin-config-override.js
+
+十二、审计结论
+
+当前版本不要继续无止境往 OnlineImage 里塞逻辑。
+下一步应该先做一次“官方 API 收口 + 背景状态写入统一队列 + 删除死代码 + 预设 Picker 改官方 Picker”的结构性整理。
+
+这样后续增加：
+- 多 URL 动态背景
+- 权重
+- 缓存
+- URL 失败切换
+- CSS
+- 自定义图片
+
+都可以建立在更清晰的基础上，而不是继续叠加互相调用的小函数。

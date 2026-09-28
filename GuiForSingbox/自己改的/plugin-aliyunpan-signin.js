@@ -2,7 +2,14 @@
 const CONFIG_KEY = 'RefreshTokenList'
 const TOKEN_CONFIG = 'data/.cache/aliyunpan-signin.json'
 const LEGACY_TOKEN_CONFIG = 'data/third/aliyunpan-signin/config.json'
-const UA = 'Mozilla/5.0 (iPhone; U; CPU iPhone OS 4_3_3 like Mac OS X; en-us) AppleWebKit/533.17.9 (KHTML, like Gecko) Version/5.0.2 Mobile/8J2 Safari/6533.18.5'
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) aDrive/6.9.3 Chrome/112.0.5615.165 Electron/24.1.3.6 Safari/537.36'
+const x_device_id = '3864052d49d878bbe8ad997402fda4cd58c32d682db5441b413299a9adab6ac3'
+const x_canary = 'client=windows,app=adrive,version=v6.9.3'
+const authorization =
+  'Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI1ZWVjNmMyMDNlODM0ZWM0YjY1MjQzYThiZDQxNzI1ZiIsImN1c3RvbUpzb24iOiJ7XCJjbGllbnRJZFwiOlwiMjVkelgzdmJZcWt0Vnh5WFwiLFwiZG9tYWluSWRcIjpcImJqMjlcIixcInNjb3BlXCI6W1wiRFJJVkUuQUxMXCIsXCJTSEFSRS5BTExcIixcIkZJTEUuQUxMXCIsXCJVU0VSLkFMTFwiLFwiVklFVy5BTExcIixcIlNUT1JBR0UuQUxMXCIsXCJTVE9SQUdFRklMRS5MSVNUXCIsXCJCQVRDSFwiLFwiT0FVVEguQUxMXCIsXCJJTUFHRS5BTExcIixcIklOVklURS5BTExcIixcIkFDQ09VTlQuQUxMXCIsXCJTWU5DTUFQUElORy5MSVNUXCIsXCJTWU5DTUFQUElORy5ERUxFVEVcIl0sXCJyb2xlXCI6XCJ1c2VyXCIsXCJyZWZcIjpcImh0dHBzOi8vd3d3LmFsaXl1bmRyaXZlLmNvbS9cIixcImRldmljZV9pZFwiOlwiNGI5MDlmYzAzNGY4NDBkY2FhYjM5ODYwNmZjOTVkMDdcIn0iLCJleHAiOjE3OTA1MzE2NDQsImlhdCI6MTc5MDUyNDM4NH0.HkY6R6vU2oWABJviyz0RWq9IeG242c3webwxR2tZfrmgM-Qj89NCS4WNaNojTWjdUSCnhPiqXhvqOxvsG-F_ifUybGFJXSPkLFs_Kaj6hbed5ByxzIoncCAAJPOTOiqIhUTJ8ZsK2yP_ViMzBfaqXN6Qu2RQPtoGA4aMO6qZAVY'
+const x_timestamp = new Date()
+const x_nonce = crypto.randomUUID()
+const x_signature_v2 = '1863e62a2d8b584241a95c710b14c0ed299fa42e'
 const normalizeTokens = (tokens) => [...new Set(tokens.map((token) => token.trim()).filter(Boolean))]
 const getConfigTokens = () => {
   const plugin = Plugins.usePluginsStore().getPluginById(Plugin.id)
@@ -230,15 +237,16 @@ const signIn = async (accessToken) => {
   if (!body.success) throw new Error(body.message || '签到失败')
   const { signInCount, signInLogs } = body.result
   const messages = [`签到成功，累计签到 ${signInCount} 天。`]
-  // for (const log of signInLogs.filter((log) => log.status === 'normal' && !log.isReward)) {
-  //   try {
-  //     const reward = await post('https://member.aliyundrive.com/v1/activity/sign_in_reward?_rx-s=mobile', { signInDay: log.day }, accessToken)
-  //     if (!reward.success) throw new Error(reward.message || '领取失败')
-  //     messages.push(`第 ${log.day} 天奖励领取成功`)
-  //   } catch (error) {
-  //     messages.push(`第 ${log.day} 天奖励领取失败：${error.message || error}`)
-  //   }
-  // }
+  for (const log of signInLogs.filter((log) => log.status === 'normal' && !log.isReward)) {
+    //   try {
+    // const reward = await post('https://member.aliyundrive.com/v1/activity/sign_in_reward?_rx-s=mobile', {"signInDay": log.day }, accessToken)
+    console.log("🚀~ 'Xuzq' ~ signIn ~ log.day:", log.day)
+    //     if (!reward.success) throw new Error(reward.message || '领取失败')
+    //     messages.push(`第 ${log.day} 天奖励领取成功`)
+    //   } catch (error) {
+    //     messages.push(`第 ${log.day} 天奖励领取失败：${error.message || error}`)
+    //   }
+  }
   return messages
 }
 const capacity = async (accessToken) => {
@@ -284,7 +292,8 @@ const SignIn = async () => {
     } catch (error) {
       results.push(`账号 ${index + 1} 刷新失败：${error.message || error}`)
       continue
-    }  const nick_name = account.nick_name || `账号 ${index + 1}`
+    }
+    const nick_name = account.nick_name || `账号 ${index + 1}`
     const user_name = getDisplayUserName(account.user_name) || `账号 ${index + 1}`
     // refresh_token 会轮换：签到前立即持久化，写入失败时停止处理后续账号。
     tokenMap[token] = { nick_name: account.nick_name, user_name: user_name, refresh_token: account.refresh_token }
