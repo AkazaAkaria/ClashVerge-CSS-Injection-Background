@@ -16,15 +16,22 @@ export default (Plugin) => {
   const LEGACY_CUSTOM_CONFIG_KEY = `${LEGACY_STORAGE_ID}:custom-config:v2`
 
   // T01c「强制接管」名单 —— 用户明确要求接管的、**原本会被结构性剔除**的组。
-  // 为什么默认是这三个（2026-09-29 用户明确选择）：
-  //   🚀 节点选择 —— 27 叶子 / 被 14 个组引用的共享组，但也是用户的主选择器；
-  //   🐟 漏网之鱼 —— route.final 兜底出口；
-  //   GLOBAL      —— 宿主保留根选择器。
+  // 当前默认只剩这一个（2026-09-30 用户决定）：
+  //   🚀 节点选择 —— 27 叶子 / 被 14 个组引用的共享组，但也是用户的主选择器 ⇒ 保留强制接管。
+  // 已移除的两项（此前被默认放行，实测都是**空转 Manager**：每轮只报「没有可检测的节点池」）：
+  //   GLOBAL      —— 宿主保留根选择器，改它等于改全局默认出口（是控制面不是策略面，不越权）；
+  //   🐟 漏网之鱼 —— route.final 兜底出口，且自己没有叶子池。
+  //   两者本来就在结构性拦截集里（RESERVED_GROUPS / route.final），只是**被本名单放行**才"漏网"。
   // 关掉它的方式（任选，都不用改源码）：
   //   ① 面板 →「自定义配置」页 → 取消勾选「强制接管共享/兜底组」；
   //   ② 清掉 localStorage 的 FORCE_MANAGED_KEY（清掉即回落到本默认值）；
   //   ③ 把本数组改成 []。
-  const DEFAULT_FORCE_MANAGED = ['🚀 节点选择', '🐟 漏网之鱼', 'GLOBAL']
+  const DEFAULT_FORCE_MANAGED = ['🚀 节点选择']
+  // ★ 退役名单：GLOBAL / 🐟 漏网之鱼 不再允许被强制接管。
+  //   为什么必须显式拦、而不是只把默认值改小：默认值**只在 localStorage 没存过时才生效**
+  //   （readForceManaged 的 `raw === null` 分支）—— 已经存过旧 3 项的机器改默认值**根本不会生效**。
+  //   这就是「改了默认值 = 白改」那一类坑：凡是从持久化里读出来的名单，都要在**读取侧**再拦一次。
+  const RETIRED_FORCE_MANAGED = new Set(['GLOBAL', '🐟 漏网之鱼'])
   const FORCE_MANAGED_KEY = `${STORAGE_ID}:force-managed:v1`
 
   // T02：面板列表的「用户自定义顺序」。配置页的可选组列表与工作台的策略组列表**共用这一份**。
@@ -62,7 +69,20 @@ export default (Plugin) => {
   // 源码版本。唯一可靠指纹 —— 宿主 plugins.yaml 里的 version 是宿主侧字段，
   // 改了源码不同步它就会「认版本认错」，因此面板标题一律显示这里的值。
   // T05d = 快检通道可观测性修复（P0-1 早退留痕 / P0-2 预览态读数诚实化 / P1-3 死字段接 UI）。
-  const VERSION = 'v5.4.1-T05d'
+  // T05e = 三条 P0 行为缺陷修复：
+  //   ① tickCurrent 的 opts.preview 不再是死参数（预览态「立即全检」也出当前节点读数）；
+  //   ② 手动选择受保护窗口尊重（只挡性能优化切换，故障切换照走）；
+  //   ③ 手动切换不再消耗「每小时切换额度」（只留冷却防抖与共享池防抖）。
+  // T05f = P0-② 的另一半：用户在**宿主 App 代理页**里直接选的节点同样受保护
+  //   （externalSelection）。只修面板「使用」按钮等于只修了一半 —— 用户在 App 里改出口是更常见的一条路。
+  // T05g = 修「外部选择检测」的根子：
+  //   ① syncExternalState 原来是「相隔 0ms 的两次同一来源读取」对比，直读缓存存在时**恒等**
+  //      ⇒ 调度运行中检测路径是死的。改为持久化 `lastObservedCurrent` 做跨拍对比。
+  //   ② `syncManagersFromKernel` 只在面板挂载/onMounted 的定时器里跑（面板一关就停）
+  //      ⇒ 借道 tickCurrent（唯一每 30s 必然跑一次的通道，同 T05 watchdog 的借法）。
+  // T05h = 删掉 `toView().probePreview` 死字段（T05d 引入，全文除输出点外 0 引用）。
+  //   预览态与否改由 `currentTickText` 单独承载 —— 同一事实不留两个载体。
+  const VERSION = 'v6.3.0-lifecycle-marks'
 
   const DEFAULT_OPTIONS = {
     managedGroups: [],
@@ -111,7 +131,63 @@ export default (Plugin) => {
     //     （防止 96~130 成员的池一次性把探测预算打满）
     fullSweepMaxPoolSize: 32,
     poolCoverageTargetMs: 1800000,
-    poolCoverageMaxNodes: 16
+    poolCoverageMaxNodes: 16,
+    // ---- T05e/P0-②：手动选择保护窗口 ----
+    // 用户在面板点某节点行的「使用」⇒ 该节点在窗口内不被自动调度以「发现更优节点」为由推翻。
+    // 旧版只有 minSwitchInterval（默认 900s）兜底 ⇒ 15 分钟后用户的选择就被自动切回，
+    // 而同类插件 B 有 externalSelection 机制明确尊重手动选择，A 完全没有。
+    // ★ 硬边界：这个窗口**只挡性能优化切换**，绝不挡故障切换（evaluateSwitch 的 isCurrentDead /
+    //   failoverFromCurrent 分支在保护判据**之前**，照常执行）。把「尊重用户」做成「故障时不自愈」
+    //   是比不尊重更坏的结果。
+    // 0 = 关闭保护（回到旧行为）。默认 30 分钟是保守值：比 minSwitchInterval(15 分钟) 长一倍，
+    // 又不至于让一次误点长期锁死自动择优。
+    // [内部参数] 当前宿主 configuration 未暴露该键，暂不可通过 App 修改（改值需编辑本文件 DEFAULT_OPTIONS）。
+    manualProtectWindow: 1800000,
+    // ---- T05i：全局探测预算（外部审查采纳项）----
+    // 为什么必须有：并发度是**每组**的（concurrencyLimit 4 / serviceConcurrency 2），
+    //   但请求打的是**同一个内核**。真机 19 个受管组同时全池巡检 ⇒ 瞬时请求数 = 组数 × 组内并发，
+    //   内核 clash_api 一慢就会出现「全组一起超时」⇒ 全员被判失败 ⇒ 一批假故障切换。
+    //   组内闸门管不住组间叠加，必须在组之上再加一层**全局**闸门。
+    // 硬边界：超预算 ⇒ 拒绝发起，且**绝不记节点失败**（否则预算闸门本身变成"制造故障的机器"）。
+    // 0 = 关闭闸门（回到旧行为）。
+    //
+    // ★★ 为什么默认是 0（关闭）而不是一个"看起来合理"的数字 —— 这是本次实测的结论，不是偷懒：
+    //   真机量级：19 组 × 单轮最多 27 节点 × 5 个探测服务 ≈ **单轮 2565 次请求**；
+    //   19 组的定时器被 groupStartDelay(1.2s) 错开后仍会在 ≈30s 内叠成一次爆发 ⇒ 峰值 ≈50 次/秒。
+    //   任何"看起来合理"的保守值（120/min、600/min）都会在这场爆发里大面积拒绝探测
+    //   ⇒ 巡检覆盖率被打回 T05 之前的老问题（27 池永远扫不完），而且是**静默**地退化。
+    //   ⇒ **未标定的闸门比没有闸门更坏**：它让插件在未知时刻少干活，却看起来一切正常。
+    //   判据（MEMORY 2.3c）：默认值必须是实测出来的，不能是拍出来的。内核承载上限尚未上机标定，
+    //   因此默认关闭；等拿到实测值后再开启并写死在那里。
+    // [内部参数] 当前宿主 configuration 未暴露该键，暂不可通过 App 修改。
+    globalProbeBudget: 0,
+    // 预算窗口（滑动）。与 globalProbeBudget 配对；单独设它而 budget=0 ⇒ 闸门仍是关闭的。
+    // [内部参数] 当前宿主 configuration 未暴露该键，暂不可通过 App 修改。
+    globalProbeWindowMs: 60000,
+    // ---- T05m：运行时监督（Crash Recovery）----
+    // maxRestarts = 0 的语义是**关闭监督**（不是"无限次"）—— 必须留一个真正的关闸。
+    supervisorMaxRestarts: 3,
+    supervisorCooldownMs: 600000,
+    supervisorStaleFactor: 4,
+    // ---- v6.0：Logger 基础落盘（只落 warn / error）----
+    // 为什么必须有：日志原本只活在 `this.logs`（内存，上限 logLimit=120）。插件重载 / 面板关闭即丢，
+    //   事后取证只能靠用户当场截图。落盘的**唯一目的**是取证，因此约束比"多记点"更重要。
+    // 1 = 开，0 = 关。关闭时不只是「不再写新日志」，还会把已落盘的文件删掉（宿主 RemoveFile 幂等）。
+    logPersistEnabled: 1,
+    // 单文件封顶（字节）。超过就**从头部裁剪**（保留最新的），绝不无限长胖。
+    // 0 = 不封顶（语义必须可达，同 failoverCooldown 的纪律）；真机不建议置 0。
+    logPersistMaxBytes: 262144,
+    // 节流闸门 A：累计 N 条才写一次。0 = 关闭该闸门（另一条闸门仍可触发）。
+    logPersistFlushEvery: 20,
+    // 节流闸门 B：距上次写入 ≥ 该毫秒才写一次。0 = 关闭该闸门。
+    // 为什么必须双闸门：只按条数，低频异常（最需要留证的那类）可能永远攒不够 N 条；
+    // 只按时间，突发的一批 warn 会被攒到 30s 后才落盘，插件若在此期间崩溃就全丢。
+    //
+    // ★★ 这两个默认值为什么可以"拍"而不用先标定（对比 T05i 的 globalProbeBudget 必须默认 0）：
+    //   节流是**延后**，不是**拦截** —— 最坏结果是"晚一点落盘"，不会静默掐掉功能；
+    //   而探测预算是拦截，未标定的闸门会让插件在未知时刻少干活却看起来一切正常。
+    //   时间闸门额外保证：只要插件还在跑，30s 内必落一次（不会攒到天荒地老）。
+    logPersistFlushIntervalMs: 30000
   }
 
   const COMMON_SERVICES = [
@@ -217,15 +293,23 @@ export default (Plugin) => {
 
   // T01c「强制接管」名单的运行时状态。读取顺序：localStorage → 源码默认值。
   // 注：localStorage 是宿主契约里唯一可靠的「运行期开关」载体（plugins.yaml 会被宿主整份回写）。
+  // 唯一的退役过滤点：默认值与 localStorage 两条分支都走它，避免"只拦了一边"的漏网。
+  // 只过滤**读**路径（load），不过滤 setForceManaged 的写入参数 —— 后者是显式的即时选择，
+  // 且面板开关只会写入 DEFAULT_FORCE_MANAGED（本就是干净的）。
+  const sanitizeForceManaged = (list) =>
+    (Array.isArray(list) ? list : []).filter(
+      (name) => typeof name === 'string' && name && !RETIRED_FORCE_MANAGED.has(name)
+    )
+
   function readForceManaged() {
     try {
       const raw = localStorage.getItem(FORCE_MANAGED_KEY)
-      if (raw === null) return [...DEFAULT_FORCE_MANAGED]
+      if (raw === null) return sanitizeForceManaged([...DEFAULT_FORCE_MANAGED])
       const parsed = JSON.parse(raw)
       if (!Array.isArray(parsed)) return []
-      return parsed.filter((name) => typeof name === 'string' && name)
+      return sanitizeForceManaged(parsed)
     } catch (err) {
-      return [...DEFAULT_FORCE_MANAGED]
+      return sanitizeForceManaged([...DEFAULT_FORCE_MANAGED])
     }
   }
   const forceManagedGroups = ref(readForceManaged())
@@ -280,6 +364,54 @@ export default (Plugin) => {
     }
   }
   const autoStart = ref(readAutoStart())
+  // T05i：非 Selector 组「软拦截」的提示计数。
+  // 为什么不放在 setup() 里：`Plugins.message.info` 只是宿主侧的一次性弹条，harness 够不着；
+  // 而这个计数才是「到底提示了没有」的可断言证据。放在模块级（与 autoStart 同一纪律）。
+  const manualSwitchWarned = ref(0)
+
+  // ============================ T05j：只读观察名单（GLOBAL 争议项的可控解） ============================
+  // 外部审查（两轮，两份不同来源）都把「GLOBAL 被自动切换」列为**最大架构争议点**：
+  //   GLOBAL 是宿主的**控制面**不是策略面 —— 它的 `all` 是所有顶层组，改它等于改全局默认出口。
+  //   所有 `route` 未命中的流量都走它 ⇒ 一次误切的波及面远大于普通策略组。
+  //
+  // ★ 2026-09-30 追加：GLOBAL 已从 DEFAULT_FORCE_MANAGED 移除（与 🐟 漏网之鱼 一起，
+  //   两者实测都是空转 Manager），即**默认不再接管 GLOBAL**；随即**面板开关也一并移除** ——
+  //   GLOBAL 都不受管了，开关没有任何可见效果，留着就是「看得见、底下没人读」的可配置错觉。
+  //   ★ 底层能力（名单 + switchTo 里那道拦截）保留为「无入口的内部能力」：它落在 v6.0 冻结区
+  //     （改 switchTo = 解冻操作），且任何组将来需要「只检测不切换」时可原样复用。
+  //
+  //   （原注保留以说明这套机制当初的取舍：做成「名单 + 面板开关」而不是直接删掉，
+  //    是因为删掉是单向的，而「管 GLOBAL」有真实价值 —— 它是很多人的主出口，
+  //    不管就永不自动择优。这是一个取舍不是 bug。2026-09-30 用户已拍板：默认不管。）
+  //
+  // ★ 语义硬边界（错一条就把「观察」做成「假保护」）：
+  //   ① 只挡**切换**，不挡检测 —— 观察模式的价值恰恰是「看见但不动手」，不检测等于没观察；
+  //   ② 挡在 switchTo 这个**唯一收口**上 —— 自动切换 / 故障切换 / 面板手动「使用」全部经它，
+  //      一处拦截即全覆盖，绝不在 evaluateSwitch / failoverFromCurrent 各判一次（判据一分叉就漂移）；
+  //   ③ 必须留痕 —— 静默拒绝正是本项目反复消灭的失效形态（MEMORY 2.10d）。
+  const OBSERVE_ONLY_KEY = `${STORAGE_ID}:observe-only:v1`
+  const readObserveOnly = () => {
+    try {
+      const raw = localStorage.getItem(OBSERVE_ONLY_KEY)
+      if (!raw) return []
+      const list = JSON.parse(raw)
+      return Array.isArray(list) ? list.filter((n) => typeof n === 'string' && n) : []
+    } catch (err) {
+      return []
+    }
+  }
+  const observeOnlyGroups = ref(readObserveOnly())
+  const setObserveOnly = (list) => {
+    const next = Array.isArray(list) ? list.filter((n) => typeof n === 'string' && n) : []
+    observeOnlyGroups.value = [...new Set(next)]
+    try {
+      localStorage.setItem(OBSERVE_ONLY_KEY, JSON.stringify(observeOnlyGroups.value))
+    } catch (err) {
+      console.warn('[smart-policy] 只读观察名单写入 localStorage 失败，本次仅内存生效', err)
+    }
+  }
+  const isObserveOnly = (name) => observeOnlyGroups.value.includes(name)
+
   const setAutoStart = (value) => {
     autoStart.value = value !== false
     try {
@@ -654,7 +786,25 @@ export default (Plugin) => {
       // ---- T05 新增参数（全池覆盖率）----
       fullSweepMaxPoolSize: posNum(config.FullSweepMaxPoolSize, DEFAULT_OPTIONS.fullSweepMaxPoolSize, 0, true),
       poolCoverageTargetMs: posNum(config.PoolCoverageTargetMs, DEFAULT_OPTIONS.poolCoverageTargetMs, 0),
-      poolCoverageMaxNodes: posNum(config.PoolCoverageMaxNodes, DEFAULT_OPTIONS.poolCoverageMaxNodes, 1, true)
+      poolCoverageMaxNodes: posNum(config.PoolCoverageMaxNodes, DEFAULT_OPTIONS.poolCoverageMaxNodes, 1, true),
+      // ---- T05e 新增参数（P0-② 手动选择保护窗口）----
+      // 下限取 0：0 的语义是「关闭保护」，必须允许用户显式关闭（同 failoverCooldown 的纪律）。
+      manualProtectWindow: posNum(config.ManualProtectWindow, DEFAULT_OPTIONS.manualProtectWindow, 0),
+      // ---- T05i 新增参数（全局探测预算）----
+      // 下限取 0：0 = 关闭闸门，语义必须可达（同上的纪律）。
+      globalProbeBudget: posNum(config.GlobalProbeBudget, DEFAULT_OPTIONS.globalProbeBudget, 0, true),
+      globalProbeWindowMs: posNum(config.GlobalProbeWindowMs, DEFAULT_OPTIONS.globalProbeWindowMs, 0),
+      // ---- T05m 新增参数 ----
+      supervisorMaxRestarts: posNum(config.SupervisorMaxRestarts, DEFAULT_OPTIONS.supervisorMaxRestarts, 0, true),
+      supervisorCooldownMs: posNum(config.SupervisorCooldownMs, DEFAULT_OPTIONS.supervisorCooldownMs, 0),
+      supervisorStaleFactor: posNum(config.SupervisorStaleFactor, DEFAULT_OPTIONS.supervisorStaleFactor, 2),
+      // ---- v6.0 新增参数（Logger 基础落盘）----
+      // 下限一律取 0：0 的语义是「关闭」（落盘 / 封顶 / 条数闸门 / 时间闸门），必须可达
+      // （同 failoverCooldown 的纪律 —— 用 `config.X || def` 会把用户显式填的 0 当成「没填」）。
+      logPersistEnabled: posNum(config.LogPersistEnabled, DEFAULT_OPTIONS.logPersistEnabled, 0, true),
+      logPersistMaxBytes: posNum(config.LogPersistMaxBytes, DEFAULT_OPTIONS.logPersistMaxBytes, 0, true),
+      logPersistFlushEvery: posNum(config.LogPersistFlushEvery, DEFAULT_OPTIONS.logPersistFlushEvery, 0, true),
+      logPersistFlushIntervalMs: posNum(config.LogPersistFlushIntervalMs, DEFAULT_OPTIONS.logPersistFlushIntervalMs, 0)
     }
     // ★ T05：参数自洽校正 —— 拦住「快检静默失效」这条隐性事故。
     //   `CurrentFailureWindow` 必须 ≥ `CurrentFailureThreshold × CurrentCheckInterval`：
@@ -880,6 +1030,684 @@ export default (Plugin) => {
     }
   }
 
+  // ============================ T05i：全局探测预算闸门 ============================
+  // 外部审查（ChatGPT 五轮）唯一说对而我们确实缺的一条：并发度是**每组**的闸门，
+  // 组与组之间没有任何总量约束。真机 19 个受管组同时全池巡检 ⇒ 瞬时请求打满同一个内核。
+  // 本闸门是**跨 Manager 共享**的（模块级单例），因为要管的正是「组叠加」这件事本身。
+  //
+  // 三条硬边界（缺一条就会把"保护"做成"制造故障"）：
+  //   ① 超预算 ⇒ **拒绝发起**，绝不把"没探"伪装成"探了但失败"；
+  //   ② 拒绝**绝不记节点失败**（否则预算一紧就全员熔断 ⇒ 一批假故障切换）；
+  //   ③ 拒绝**必须留痕**（面板 + 日志）—— 静默早退正是本项目反复消灭的那类缺陷（MEMORY 2.10d）。
+  const PROBE_BUDGET = {
+    stamps: [],
+    rejected: 0,
+    lastRejectAt: 0,
+    lastRejectReason: ''
+  }
+
+  const claimProbeSlot = (limit, windowMs) => {
+    const lim = Number(limit)
+    const win = Number(windowMs)
+    // 0 / 非法 = 闸门关闭（放行）。语义必须可达：用户要能显式关掉它。
+    if (!Number.isFinite(lim) || lim <= 0) return true
+    if (!Number.isFinite(win) || win <= 0) return true
+    const now = Date.now()
+    // 顺带回收：stamps 只保留窗口内的，长度有天然上界 lim，不会无限增长。
+    PROBE_BUDGET.stamps = PROBE_BUDGET.stamps.filter((t) => now - t < win)
+    if (PROBE_BUDGET.stamps.length >= lim) {
+      PROBE_BUDGET.rejected += 1
+      PROBE_BUDGET.lastRejectAt = now
+      PROBE_BUDGET.lastRejectReason = `全局探测预算已用尽（${PROBE_BUDGET.stamps.length}/${lim} 次 · ${Math.round(win / 1000)}s 窗口）`
+      return false
+    }
+    PROBE_BUDGET.stamps.push(now)
+    return true
+  }
+
+  // 供测试/取证读取闸门状态（只读快照，不暴露可写引用）。
+  const probeBudgetSnapshot = () => ({
+    used: PROBE_BUDGET.stamps.length,
+    rejected: PROBE_BUDGET.rejected,
+    lastRejectAt: PROBE_BUDGET.lastRejectAt,
+    lastRejectReason: PROBE_BUDGET.lastRejectReason
+  })
+
+  // 供测试复位（跨 Manager 的模块级状态无法从外部重置，见 MEMORY 2.11 的模块级缓存坑）。
+  const resetProbeBudget = () => {
+    PROBE_BUDGET.stamps = []
+    PROBE_BUDGET.rejected = 0
+    PROBE_BUDGET.lastRejectAt = 0
+    PROBE_BUDGET.lastRejectReason = ''
+  }
+
+  // ============================ T05i：日志脱敏 ============================
+  // 插件日志会经宿主转发进 App 日志与控制台。探测 URL / 自定义服务 URL 的 query 里
+  // 可能带 token / secret / access_key（用户自己填的），裸写等于把凭据粘进日志。
+  // ★ 只脱敏「凭据」，**保留**节点名 / 组名 / 分数 / 时间 —— 这些是排查所必需的，
+  //   把它们一起抹掉会让日志失去全部取证价值（脱敏过度 = 另一种不可用）。
+  // ★ 脱敏失败绝不能影响日志本身：catch 后原样返回，宁可多写也不能吞掉一条异常。
+  const SENSITIVE_ASSIGN_RE = /([A-Za-z0-9_.-]*(?:token|secret|passwd|password|pwd|api[_-]?key|access[_-]?key)[A-Za-z0-9_.-]*)\s*=\s*([^\s&;"'`,\]}]+)/gi
+  const URL_QUERY_RE = /((?:https?:\/\/)[^\s"'`]+)\?[^\s"'`]*/gi
+
+  // ============================ T05i：非 Selector 组的手动切换守卫 ============================
+  // 真机 19 个受管组 = 18 Selector + 1 URLTest（🎈 自动选择，96 成员），面板对后者照样渲染「使用」按钮。
+  // ★ 为什么抽成**纯函数**：判据必须可断言。留在 setup() 里的分支 harness 根本够不着，
+  //   只能靠"看着像对"签收 —— 那正是本项目反复消灭的假验收（MEMORY 2.11）。
+  // ★ 为什么 warn=true 时**仍返回 block=false**（软拦截）：
+  //   ① 类型为 ''（读不到）时硬拦 ⇒ 把「不知道」当成「不可能」，越权禁掉功能（MEMORY 2.10g）；
+  //   ② 各内核版本对 URLTest 的 PUT 行为并不一致，写死「必然失败」是拿猜测替代事实；
+  //   ③ 真失败了由既有兜底处理（waitForApplied 回读确认失败 ⇒ switchTo 返回 false ⇒ 弹「切换未生效」）。
+  const manualSwitchGuard = (groupType) => {
+    const raw = String(groupType || '')
+    const t = raw.toLowerCase()
+    if (!t) return { warn: false, block: false, type: '' }
+    if (t === 'selector') return { warn: false, block: false, type: t }
+    return {
+      warn: true,
+      block: false,
+      type: t,
+      message: `类型为 ${raw}（自动测速组）——内核可能不接受手动指定，仍尝试提交`
+    }
+  }
+
+  const redact = (text) => {
+    if (text === undefined || text === null) return ''
+    let out = String(text)
+    try {
+      out = out.replace(URL_QUERY_RE, '$1?***')
+      out = out.replace(SENSITIVE_ASSIGN_RE, '$1=***')
+    } catch (_) {
+      return String(text)
+    }
+    return out
+  }
+
+  // ============================ v6.0：Logger 基础落盘 ============================
+  // 为什么这是**真缺口**：日志原本只活在 `this.logs`（内存数组，上限 logLimit=120）。
+  //   插件重载 / 面板关闭 / App 退出即丢 —— 事后取证只能靠用户当场截图，而"出事的那一拍"
+  //   恰恰是用户最不可能正在盯面板的时刻（真机 2026-09-30 那次取不上证就是这么来的）。
+  //
+  // ★★ 落盘是**辅助功能**，三条硬边界缺一不可：
+  //   ① 只落 warn / error —— 落盘的目的是取证，正常流水（muted / info / success）只会把文件喂胖，
+  //      把真正的异常稀释在几千行噪声里；
+  //   ② 复用 `redact()` —— ★ 绝不能把订阅 URL / token / secret / api_key 写进磁盘。
+  //      落盘件是**长期留存物**，比一闪而过的弹条更需要脱敏；
+  //   ③ 任何 IO 失败**静默降级** —— 不许抛出、不许打断巡检、不许影响调度主流程。
+  //      写盘失败最多损失取证材料，抛出去会让整轮巡检挂掉，两者损失不对等。
+  //
+  // ★ 关于宿主 IO 契约（已取证，见本次报告）：`Plugins.ReadFile(p)` / `Plugins.WriteFile(p, text)` /
+  //   `Plugins.RemoveFile(p)` 三参/两参/一参形态，全部在失败时 throw。
+  //   刻意**不用** `Plugins.FileExists`：宿主该接口返回类型不一致（布尔 或 字符串 "false"），
+  //   判空靠 `ReadFile` + try/catch 更可靠，也少一次 IO。
+  //   写入用默认（空 Range）= 截断覆写 ⇒ 落盘一律走「读旧 + 追加新 + 封顶 + 整份写回」，
+  //   绝不去碰 Range 的边界语义（宿主对它有硬校验，猜错就是写坏文件）。
+  const LOG_PERSIST_LEVELS = { warn: true, error: true }
+  const LOG_PERSIST_DIR = 'data/.cache'
+  const LOG_PERSIST_PATH = `${LOG_PERSIST_DIR}/${STORAGE_ID}-warn-error.log`
+  // 落盘开关的**真实载体**（localStorage）。为什么不能只靠 `config.LogPersistEnabled`：
+  //   宿主 plugins.yaml 会被 App 整份回写（MEMORY 1.3），手加的行会被抹 ⇒ 用户根本没法把它设成 0
+  //   ⇒ 「这个唯一会往用户磁盘写文件的功能」变成**关不掉**（MEMORY 2.10h：判据没有"写"的一侧，
+  //   这个判断就恒为同一结果，等于没判断 —— 可配置的错觉）。范式照 T05j 只读观察（已验证可行）。
+  const LOG_PERSIST_KEY = `${STORAGE_ID}:log-persist:v1`
+  /**
+   * @returns {boolean|null} true / false = 用户存过；**null = 没存过**（三态，绝不给默认值 ——
+   *   "没存过"与"存了 false"必须能分开，否则默认关的版本永远翻不到开）。
+   */
+  const readLogPersist = () => {
+    try {
+      const raw = localStorage.getItem(LOG_PERSIST_KEY)
+      if (raw === null || raw === undefined || raw === '') return null
+      if (raw === '1' || raw === 'true') return true
+      if (raw === '0' || raw === 'false') return false
+      return null
+    } catch (_) {
+      return null
+    }
+  }
+  const logPersistOn = ref(readLogPersist())
+  const setLogPersist = (value) => {
+    const next = value !== false
+    logPersistOn.value = next
+    try {
+      localStorage.setItem(LOG_PERSIST_KEY, next ? '1' : '0')
+    } catch (err) {
+      console.warn('[smart-policy] 日志落盘开关写入 localStorage 失败，本次仅内存生效', err)
+    }
+    return next
+  }
+  const LOG_PERSIST_STATE = {
+    pending: [],        // 已过 redact、待落盘的行
+    lastFlushAt: 0,     // 上次写盘时刻（0 = 从未写过）
+    writes: 0,          // 成功写盘次数
+    failures: 0,        // IO 失败次数（静默降级计数，必须可观测）
+    droppedLines: 0,    // 被封顶从头部裁掉的旧行数
+    filteredLevels: 0,  // 被级别闸门挡下的行数
+    lastError: '',      // 最近一次 IO 失败原因
+    cleanedUp: false,   // 关闭态下是否已清理过（避免每条日志都发一次 RemoveFile）
+    dirEnsured: false,  // 目录兜底是否已试过（★ 每个进程只试一次，绝不重试循环）
+    inflight: []        // 在飞的 IO（harness 用它做确定性 drain）
+  }
+
+  const logPersistPath = () => LOG_PERSIST_PATH
+
+  /**
+   * 落盘开关的**唯一判定收口**（三态合流）：
+   *   ① localStorage 存过 ⇒ **以它为准**（config 说开也不开 / config 说关也开）；
+   *   ② 没存过（null）⇒ 回退 `options.logPersistEnabled`（= config.LogPersistEnabled，默认 1）。
+   * ★ 这样两边能力都保住：有面板时能改，没面板时 config 仍然生效 —— 原来源降级为"没存过时的默认值"。
+   */
+  const logPersistIsOn = (options) => {
+    const stored = logPersistOn.value
+    // ★ 存过就以它为准（localStorage 是唯一可靠载体），没存过（null）才回退 config
+    if (stored === true || stored === false) return stored
+    return Number(options?.logPersistEnabled) > 0
+  }
+
+  /**
+   * UTF-8 字节长度。宿主是 webview（没有 Buffer），宿主与 Node 必须算得一样，
+   * 所以手算而不依赖任何运行时 API。
+   */
+  const utf8ByteLength = (text) => {
+    const s = String(text || '')
+    let n = 0
+    for (let i = 0; i < s.length; i += 1) {
+      const c = s.charCodeAt(i)
+      if (c < 0x80) n += 1
+      else if (c < 0x800) n += 2
+      else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i += 1 }   // 代理对 = 一个字符
+      else n += 3
+    }
+    return n
+  }
+
+  /**
+   * 封顶裁剪：超过 maxBytes 就从**头部**丢整行，保留最新的。
+   * @returns {{ text: string, dropped: number }} dropped = 被丢掉的行数
+   */
+  const trimLogPersistText = (text, maxBytes) => {
+    const cap = Number(maxBytes)
+    const raw = String(text || '')
+    // 0（及非有限数）= 不封顶，语义必须可达
+    if (!Number.isFinite(cap) || cap <= 0) return { text: raw, dropped: 0 }
+    if (utf8ByteLength(raw) <= cap) return { text: raw, dropped: 0 }
+    const lines = raw.split('\n')
+    let dropped = 0
+    // ★ 循环条件保留 lines.length > 1：最后一行本身就超长时也不把它砍成半条 ——
+    //   半条日志比一条超长日志更糟（取证时读不出完整信息，还伪装成"裁剪生效了"）。
+    while (lines.length > 1 && utf8ByteLength(lines.join('\n')) > cap) {
+      lines.shift()
+      dropped += 1
+    }
+    return { text: lines.join('\n'), dropped }
+  }
+
+  const logPersistHost = () => (typeof Plugins === 'undefined' ? null : Plugins)
+
+  /**
+   * 宿主 `FileExists` 的返回类型**不一致**（有时布尔、有时字符串 "true"/"false"）⇒ 两边都认。
+   * 只用它判「文件在不在」，绝不用它判内容。
+   *
+   * ★ 已知未知（本机证不死，留给下一个人，别猜）：宿主 wrapper 是 `if (!flag) throw data`，
+   *   而已装插件都在不包 try/catch 的前提下拿它判"文件在不在"（说明 Go 侧对不存在的文件
+   *   返回的是 flag=true + data="false"）。**若某些宿主版本对不存在的文件直接抛错**，
+   *   本实现会退化为「从不写入」并计入 failures（failures 会上屏到 logPersistNotice）。
+   *   这是刻意的保守选择：宁可不落盘，也绝不覆写可能已存在的取证记录。
+   */
+  const logPersistExists = async () => {
+    const host = logPersistHost()
+    if (!host || typeof host.FileExists !== 'function') return false
+    const raw = await host.FileExists(logPersistPath())
+    if (typeof raw === 'string') return raw.trim().toLowerCase() === 'true'
+    return raw === true
+  }
+
+  /**
+   * 读旧内容。★ 必须先判存在：宿主 ReadFile 对不存在的文件是 **throw**，
+   * 而首次落盘时文件必然不存在 —— 不判就等于第一次永远写不进去（会静默退化成"从不落盘"）。
+   * 判存在之后仍读失败 ⇒ 让错误抛出：此时**绝不能**覆写（会把已有取证记录整份冲掉）。
+   */
+  const logPersistRead = async () => {
+    if (!(await logPersistExists())) return ''
+    const host = logPersistHost()
+    if (!host || typeof host.ReadFile !== 'function') return ''
+    const raw = await host.ReadFile(logPersistPath())
+    return raw === undefined || raw === null ? '' : String(raw)
+  }
+
+  const logPersistWrite = async (text) => {
+    const host = logPersistHost()
+    if (!host || typeof host.WriteFile !== 'function') throw new Error('宿主未提供 WriteFile')
+    await host.WriteFile(logPersistPath(), String(text))
+  }
+
+  const logPersistMakeDir = async () => {
+    const host = logPersistHost()
+    if (!host || typeof host.MakeDir !== 'function') return false
+    await host.MakeDir(LOG_PERSIST_DIR)
+    return true
+  }
+
+  /**
+   * 写盘 + **目录兜底**：写入失败时先 `MakeDir(dirname)` 一次，再重试写入**一次**。
+   * 为什么必须兜：目标机 `data/.cache` 确实存在（tray icon 也用它），但全新安装若不存在，
+   *   首次写入失败会退化成「静默地永远不落盘」—— 用户只会看到"日志文件一直没出现"，
+   *   而没有任何线索指向"目录不存在"（又是一个静默早退）。
+   * ★ 只试**一次**（dirEnsured 标记，每个进程一次）：未标定的 IO 重试会放大成 IO 风暴。
+   *   再失败就原样抛出 ⇒ 由 logPersistRun 静默降级（计 failures + 上屏）。
+   */
+  const logPersistWriteWithDirRetry = async (text) => {
+    try {
+      await logPersistWrite(text)
+    } catch (err) {
+      if (LOG_PERSIST_STATE.dirEnsured) throw err
+      LOG_PERSIST_STATE.dirEnsured = true
+      await logPersistMakeDir()
+      await logPersistWrite(text)
+    }
+  }
+
+  const logPersistRemove = async () => {
+    const host = logPersistHost()
+    if (!host || typeof host.RemoveFile !== 'function') return false
+    await host.RemoveFile(logPersistPath())
+    return true
+  }
+
+  /**
+   * 跑一个落盘 IO 任务：绝不抛出（失败只记数），并登记到 inflight 供 drain 等待。
+   */
+  const logPersistRun = (task) => {
+    const p = Promise.resolve()
+      .then(task)
+      .catch((err) => {
+        LOG_PERSIST_STATE.failures += 1
+        LOG_PERSIST_STATE.lastError = String(err?.message || err || '未知 IO 错误')
+        return undefined
+      })
+      .then((value) => {
+        LOG_PERSIST_STATE.inflight = LOG_PERSIST_STATE.inflight.filter((item) => item !== p)
+        return value
+      })
+    LOG_PERSIST_STATE.inflight.push(p)
+    return p
+  }
+
+  const logPersistLine = (level, message, group) => {
+    const stamp = new Date().toISOString()
+    return `${stamp} [${String(level || '').toUpperCase()}] [${String(group || '-')}] ${String(message || '')}`
+  }
+
+  /** 整份写回：读旧 + 追加新 + 封顶裁剪 + 覆写。 */
+  const logPersistFlush = (options) => {
+    const lines = LOG_PERSIST_STATE.pending
+    LOG_PERSIST_STATE.pending = []
+    LOG_PERSIST_STATE.lastFlushAt = Date.now()
+    if (!lines.length) return undefined
+    return logPersistRun(async () => {
+      const oldText = await logPersistRead()
+      const merged = oldText ? `${oldText}\n${lines.join('\n')}` : lines.join('\n')
+      const trimmed = trimLogPersistText(merged, options?.logPersistMaxBytes)
+      LOG_PERSIST_STATE.droppedLines += trimmed.dropped
+      await logPersistWriteWithDirRetry(trimmed.text)
+      LOG_PERSIST_STATE.writes += 1
+      return trimmed.text
+    })
+  }
+
+  /** 双闸门：累计 N 条 **或** 距上次写入 ≥ 间隔，任一命中才写一次。 */
+  const logPersistMaybeFlush = (options) => {
+    const every = Math.max(0, Number(options?.logPersistFlushEvery) || 0)
+    const interval = Math.max(0, Number(options?.logPersistFlushIntervalMs) || 0)
+    const now = Date.now()
+    if (!LOG_PERSIST_STATE.lastFlushAt) LOG_PERSIST_STATE.lastFlushAt = now
+    const byCount = every > 0 && LOG_PERSIST_STATE.pending.length >= every
+    const byTime = interval > 0
+      && LOG_PERSIST_STATE.pending.length > 0
+      && (now - LOG_PERSIST_STATE.lastFlushAt) >= interval
+    if (!byCount && !byTime) return false
+    logPersistFlush(options)
+    return true
+  }
+
+  /** 关闭态清理：删掉已落盘的文件（RemoveFile 幂等 ⇒ 重复调用无害）。 */
+  const logPersistCleanup = () => logPersistRun(async () => {
+    LOG_PERSIST_STATE.pending = []
+    await logPersistRemove()
+    return true
+  })
+
+  /** 入队（同步改状态、异步落盘）。返回是否触发了写入。 */
+  const logPersistEnqueue = (level, message, group, options) => {
+    try {
+      if (!logPersistIsOn(options)) {
+        LOG_PERSIST_STATE.pending = []
+        if (!LOG_PERSIST_STATE.cleanedUp) {
+          LOG_PERSIST_STATE.cleanedUp = true
+          logPersistCleanup()
+        }
+        return false
+      }
+      LOG_PERSIST_STATE.cleanedUp = false
+      if (!LOG_PERSIST_LEVELS[level]) {
+        LOG_PERSIST_STATE.filteredLevels += 1
+        return false
+      }
+      LOG_PERSIST_STATE.pending.push(logPersistLine(level, message, group))
+      return logPersistMaybeFlush(options)
+    } catch (_) {
+      // 兜底：入队本身也不许把异常抛给 addLog
+      return false
+    }
+  }
+
+  /** 面板可观测面：只在「有话要说」时非空（避免常驻噪声）。 */
+  const logPersistNoteText = () => {
+    if (LOG_PERSIST_STATE.failures) {
+      return `日志落盘：已写入 ${LOG_PERSIST_STATE.writes} 次，其中 ${LOG_PERSIST_STATE.failures} 次 IO 失败`
+        + `（已静默降级，不影响调度）—— 最近原因：${LOG_PERSIST_STATE.lastError || '未知'}`
+    }
+    return ''
+  }
+
+  const logPersistSnapshot = () => ({
+    path: logPersistPath(),
+    pending: LOG_PERSIST_STATE.pending.length,
+    writes: LOG_PERSIST_STATE.writes,
+    failures: LOG_PERSIST_STATE.failures,
+    droppedLines: LOG_PERSIST_STATE.droppedLines,
+    filteredLevels: LOG_PERSIST_STATE.filteredLevels,
+    lastError: LOG_PERSIST_STATE.lastError,
+    lastFlushAt: LOG_PERSIST_STATE.lastFlushAt
+  })
+
+  const logPersistReset = () => {
+    LOG_PERSIST_STATE.pending = []
+    LOG_PERSIST_STATE.lastFlushAt = 0
+    LOG_PERSIST_STATE.writes = 0
+    LOG_PERSIST_STATE.failures = 0
+    LOG_PERSIST_STATE.droppedLines = 0
+    LOG_PERSIST_STATE.filteredLevels = 0
+    LOG_PERSIST_STATE.lastError = ''
+    LOG_PERSIST_STATE.cleanedUp = false
+    LOG_PERSIST_STATE.dirEnsured = false
+  }
+
+  /** 等所有在飞的落盘 IO 落定（harness 用它取代 sleep 猜测）。 */
+  const logPersistDrain = async () => {
+    let guard = 0
+    while (LOG_PERSIST_STATE.inflight.length && guard < 200) {
+      await Promise.allSettled([...LOG_PERSIST_STATE.inflight])
+      guard += 1
+    }
+  }
+
+  // ============================ v6.2/P6-2：生命周期标记（崩溃 vs 正常退出） ============================
+  // 为什么需要：日志里全是「发生了什么」，但**没有边界** —— 一堆 warn 之后你分不清
+  //   那是「一个正常会话里出了几次错」还是「崩了一次又起来，日志是两截拼的」。
+  //   启停标记把日志切成**会话段**，判据非常朴素：
+  //     上次以 `=== Smart Policy Stopped ===` 结尾 ⇒ 正常退出；否则 ⇒ **没留下退出标记 = 疑似崩溃 / 被强杀**。
+  //
+  // ★ 这是「① 只落 warn/error」的**唯一例外**，刻意为之：
+  //   标记不是流水（每次启停各一条，不会把文件喂胖），而它的取证价值恰恰在
+  //   「正常的时候也要留下一条」—— 只有正常退出也会写，缺席才有意义。
+  //   但另外三条约束一条不松：仍受开关管辖、仍过 redact、仍受封顶裁剪、IO 失败仍静默降级。
+  const LOG_MARK_START = '=== Smart Policy Started ==='
+  const LOG_MARK_STOP = '=== Smart Policy Stopped ==='
+  const LOG_MARK_RECOVERY = '=== Supervisor Recovery ==='
+  // v6.3：v6.2 用的停机文案是 `=== Shutdown ===`。升级后旧落盘件的尾行仍是旧文案，
+  //   ★ 若只认新文案 ⇒ 一次**正常停机**也会被报成「疑似崩溃」—— 假警报会毁掉这个标记的公信力
+  //   （判据靠的是"正常必留痕"，升级把痕迹作废等于伪造了一次异常）。⇒ 旧文案继续认。
+  const LOG_MARK_STOP_LEGACY = ['=== Shutdown ===']
+
+  /** 尾行是否属于「正常停机」标记（新旧文案都算）。 */
+  const isStopMark = (line) =>
+    line.includes(LOG_MARK_STOP) || LOG_MARK_STOP_LEGACY.some((m) => line.includes(m))
+
+  /**
+   * 由「上一条日志尾行」判定上次是怎么退出的（纯函数 ⇒ 可被断言逐格钉死）。
+   * @returns {'clean'|'crash'|'first-run'}
+   *   clean = 上次写到了停机标记 ⇒ 正常退出；
+   *   crash = 有日志但尾行不是停机标记 ⇒ ★「没留下退出标记」；
+   *          注意语义是**疑似** —— IO 失败 / 掉电 / App 被强杀同样会没有标记，
+   *          标记的价值是「正常退出必留痕」，于是缺席就是异常信号（不是"证明崩溃"）。
+   *          ★ `=== Supervisor Recovery ===` 也归到这一类：它是一条**异常**记录，
+   *          会话以它结尾 = 那次重启之后进程又没了，正是最需要被看到的形状。
+   */
+  const classifyPrevExit = (tailLine) => {
+    const line = String(tailLine || '').trim()
+    if (!line) return 'first-run'
+    return isStopMark(line) ? 'clean' : 'crash'
+  }
+
+  /** 读落盘件最后一行非空文本。失败一律返回 ''（静默降级 —— 拿不到就不猜）。 */
+  const logPersistTailLine = async () => {
+    try {
+      const text = await logPersistRead()
+      if (!text) return ''
+      const lines = String(text).split('\n').map((l) => l.trim()).filter(Boolean)
+      return lines.length ? lines[lines.length - 1] : ''
+    } catch (_) {
+      return ''
+    }
+  }
+
+  /**
+   * 写一条生命周期标记。★ 立即 flush，不走节流双闸门：
+   *   标记稀少（每次启停各一条），且**停机时不会有下一批** —— 走闸门的话
+   *   停机那一条几乎必然永远留在内存里（那就等于没写，判据直接失效）。
+   */
+  const logPersistMarker = (text, options) => {
+    try {
+      const opts = options || getOptions()
+      if (!logPersistIsOn(opts)) return false
+      LOG_PERSIST_STATE.cleanedUp = false
+      // ★ 不进 LOG_PERSIST_LEVELS 闸门 ⇒ 也不计 filteredLevels（它不是被"挡下"的，是另一类）
+      LOG_PERSIST_STATE.pending.push(logPersistLine('MARK', redact(text), 'runtime'))
+      logPersistFlush(opts)
+      return true
+    } catch (_) {
+      return false
+    }
+  }
+
+  /** 启动标记：先读尾行判上次退出态，再写「本次启动」—— 崩溃与正常退出在这里被区分开。 */
+  const logPersistStartupMarker = (options) => logPersistRun(async () => {
+    const prev = classifyPrevExit(await logPersistTailLine())
+    const label = prev === 'clean'
+      ? '上次退出：正常（已写停机标记）'
+      : prev === 'crash'
+        ? '上次退出：未见停机标记 ⇒ 疑似崩溃 / 被强杀'
+        : '上次退出：无记录（首次运行，或日志已被封顶裁剪）'
+    return logPersistMarker(`${LOG_MARK_START} ${VERSION} —— ${label}`, options)
+  })
+
+  /** 停止标记。只在**真实的停机路径**上写（startRuntime 内部的 stop(false,true) 不算）。 */
+  const logPersistShutdownMarker = (options) => logPersistMarker(`${LOG_MARK_STOP} ${VERSION}`, options)
+
+  // ============================ T05m：运行时监督（Crash Recovery） ============================
+  // 为什么这是**真缺口**：`checkRoundWatchdog()` 只会**报告**「全池轮已停滞」，不会恢复。
+  //   而真机 2026-09-30 实录过一段 ≈25 分钟零探测的窗口 —— 那正是"整条通道死了但没人管"的情形。
+  //   「发现停滞」和「从停滞中恢复」是两件事，只做前者等于把运维动作留给人。
+  //
+  // ★★ 为什么必须带死闸门（这是本轮最需要克制的一项）：
+  //   自动重启是**唯一一个"坏了会比原故障更坏"**的功能 —— 重启风暴会让插件在用户完全
+  //   无感的情况下反复重建调度。因此三条硬边界缺一不可：
+  //     ① **次数上限**（默认 3 次）：最多重启 N 次，之后彻底闭嘴，绝不无限重试；
+  //     ② **冷却窗口**（默认 10 分钟）：两次重启之间的最小间隔，杜绝秒级抖动；
+  //     ③ **被闸门拦下也要留痕**：否则「监督器看着在跑却不动作」又是一个静默早退（MEMORY 2.10d）。
+  //   另：`maxRestarts = 0` 的语义是**关闭监督**（不是"无限次"）—— 必须留一个真正的关闸。
+  const RUNTIME_SUPERVISOR = {
+    restarts: 0,
+    lastAt: 0,
+    lastNote: '',
+    lastPlan: '',
+    notifiedAt: 0,
+    // ---- v6.2/P6-1：重启后的健康确认 ----
+    recovering: false,      // 重入标记（确认是异步的，绝不允许叠两次）
+    confirmed: 0,           // 确认通过次数
+    confirmFailed: 0,       // 确认失败次数（★ 必须可观测：见 RECOVERY_VERDICT_TEXT 注释）
+    lastConfirm: '',        // 最近一次确认结论
+    lastConfirmAt: 0,
+    lastConfirmNote: '',    // 触发那次确认的原因
+  }
+
+  // 只做**决策**，不执行重启 —— 执行与决策分离，好处是三条闸门可以被完整断言
+  // （不需要真的去 stop/start 才能验证闸门逻辑）。
+  const planRuntimeRestart = (reason, maxRestarts, cooldownMs) => {
+    const now = Date.now()
+    RUNTIME_SUPERVISOR.lastNote = reason || ''
+    const max = Number.isFinite(maxRestarts) ? Math.max(0, Math.trunc(maxRestarts)) : 3
+    const cool = Number.isFinite(cooldownMs) ? Math.max(0, cooldownMs) : 600000
+    if (max <= 0) {
+      RUNTIME_SUPERVISOR.lastPlan = 'blocked:disabled'
+      return 'blocked:disabled'
+    }
+    if (RUNTIME_SUPERVISOR.restarts >= max) {
+      RUNTIME_SUPERVISOR.lastPlan = 'blocked:limit'
+      return 'blocked:limit'
+    }
+    if (now - RUNTIME_SUPERVISOR.lastAt < cool) {
+      RUNTIME_SUPERVISOR.lastPlan = 'blocked:cooldown'
+      return 'blocked:cooldown'
+    }
+    RUNTIME_SUPERVISOR.lastPlan = 'restarted'
+    return 'restarted'
+  }
+
+  /**
+   * v6.3：异常标记 —— 每次**真正提交**的自动重启都留一条。
+   * 为什么单独一种标记：日志里「发生了什么」和「边界在哪」是两件事。没有它，
+   *   一次自动重启在文件里只是几行 warn，跟同一会话里连续报错长得一模一样 ——
+   *   事后读日志的人**分不出这是一段会话还是两段**（重启前 + 重启后）。
+   * ★ 原因直接写进标记文本（取自 RUNTIME_SUPERVISOR.lastNote）：落盘件是要能
+   *   独立读的取证材料，不能假设读它的人手上还有面板流水。
+   */
+  const logPersistRecoveryMarker = (options) => logPersistMarker(
+    `${LOG_MARK_RECOVERY} ${VERSION} —— 第 ${RUNTIME_SUPERVISOR.restarts} 次自动重启`
+    + `（原因：${RUNTIME_SUPERVISOR.lastNote || '未记录'}）`,
+    options
+  )
+
+  /**
+   * 提交一次重启。★ 这里是**唯一收口**（MEMORY「拦截点要在唯一收口」）——
+   *   恢复标记挂在这儿而不是 superviseTick 里，任何路径的提交都会留痕，
+   *   且 harness 可以直接调它做**行为级**断言（不必靠源码正则证明接线）。
+   */
+  const commitRuntimeRestart = () => {
+    RUNTIME_SUPERVISOR.restarts += 1
+    RUNTIME_SUPERVISOR.lastAt = Date.now()
+    logPersistRecoveryMarker()
+  }
+
+  // 只读快照（不暴露可写引用）—— 与 probeBudgetSnapshot 同一纪律：
+  // 测试与诊断只读，任何写入都要走显式入口，否则状态会被外部随意篡改。
+  const runtimeSupervisorSnapshot = () => ({
+    restarts: RUNTIME_SUPERVISOR.restarts,
+    lastAt: RUNTIME_SUPERVISOR.lastAt,
+    lastNote: RUNTIME_SUPERVISOR.lastNote,
+    lastPlan: RUNTIME_SUPERVISOR.lastPlan,
+    // v6.2/P6-1
+    recovering: RUNTIME_SUPERVISOR.recovering,
+    confirmed: RUNTIME_SUPERVISOR.confirmed,
+    confirmFailed: RUNTIME_SUPERVISOR.confirmFailed,
+    lastConfirm: RUNTIME_SUPERVISOR.lastConfirm,
+    lastConfirmAt: RUNTIME_SUPERVISOR.lastConfirmAt,
+  })
+
+  const resetRuntimeSupervisor = () => {
+    RUNTIME_SUPERVISOR.restarts = 0
+    RUNTIME_SUPERVISOR.lastAt = 0
+    RUNTIME_SUPERVISOR.lastNote = ''
+    RUNTIME_SUPERVISOR.lastPlan = ''
+    RUNTIME_SUPERVISOR.notifiedAt = 0
+    RUNTIME_SUPERVISOR.recovering = false
+    RUNTIME_SUPERVISOR.confirmed = 0
+    RUNTIME_SUPERVISOR.confirmFailed = 0
+    RUNTIME_SUPERVISOR.lastConfirm = ''
+    RUNTIME_SUPERVISOR.lastConfirmAt = 0
+    RUNTIME_SUPERVISOR.lastConfirmNote = ''
+  }
+
+  // ============================ v6.2/P6-1：重启后的健康确认 ============================
+  // 为什么需要：`start()` 返回 1 只代表「Manager 建好了」，**不代表通道真的在产出**。
+  //   真实存在的死法：重启成功但内核没起来（running=false / proxies 仍为空）⇒
+  //   监督器自认为"已恢复"，实际下一轮继续停滞，直到撞上 maxRestarts 才停。
+  //   期间用户看到的是「日志写着已自动重启」+「读数依然不涨」—— 两条信息互相矛盾，
+  //   比没有信息更糟（它会让人先去怀疑别的地方）。
+  //
+  // 确认链路：等内核就绪 → 探一轮 → 看有没有真的产出 → 无论成败都留痕。
+  // ★ 本层只**观测与记录**，绝不二次重启 —— 二次重启的决策权在 planRuntimeRestart 的闸门里，
+  //   确认层再动手就是两个决策点互抢（MEMORY「拦截点要在唯一收口」）。
+  // ★ 刻意**不新增配置键**：等待时长不是用户该调的东西（MEMORY 2.10h：没有写入侧的配置 = 可配置的错觉），
+  //   做成模块常量；测试需要改它时走 deps.timeoutMs 注入。
+  const SUPERVISOR_CONFIRM_TIMEOUT_MS = 15000
+
+  const RECOVERY_VERDICT_TEXT = {
+    confirmed: '恢复确认通过（内核就绪且探测有产出）',
+    'kernel-not-ready': '内核未就绪（重启后仍拿不到出站表）',
+    'no-manager': '没有可用的调度组',
+    'no-session': '会话已失效（重启后未建立运行代际）',
+    'no-probe-output': '探测无产出（通道起来了但没探出结果）',
+    error: '确认过程异常',
+    'skip-inflight': '上一次确认仍在进行（本次跳过）',
+  }
+
+  /** 记录结论并留痕。★ 失败必须看得见 —— 否则「重启了但没恢复」会被静默当成「恢复成功」。 */
+  const finishRecovery = (verdict, reason, target) => {
+    RUNTIME_SUPERVISOR.lastConfirm = verdict
+    RUNTIME_SUPERVISOR.lastConfirmAt = Date.now()
+    RUNTIME_SUPERVISOR.lastConfirmNote = reason || ''
+    if (verdict === 'confirmed') RUNTIME_SUPERVISOR.confirmed += 1
+    else if (verdict !== 'skip-inflight') RUNTIME_SUPERVISOR.confirmFailed += 1
+    const text = `运行时监督：重启后健康确认 = ${RECOVERY_VERDICT_TEXT[verdict] || verdict}`
+    if (target && typeof target.addLog === 'function') {
+      // 成功用 success（不落盘，只是面板流水）；失败用 warn（会落盘 ⇒ 事后能取到证）
+      target.addLog(verdict === 'confirmed' ? 'success' : 'warn', text)
+    } else {
+      console.warn(`[smart-policy] ${text}`)
+    }
+    return verdict
+  }
+
+  /**
+   * 重启后的健康确认。deps 全是**可注入**的（默认取真实运行时），harness 靠它做确定性断言。
+   * @returns {string} 见 RECOVERY_VERDICT_TEXT
+   */
+  const confirmRuntimeRecovery = async (reason, deps = {}) => {
+    if (RUNTIME_SUPERVISOR.recovering) return 'skip-inflight'
+    RUNTIME_SUPERVISOR.recovering = true
+    try {
+      const timeoutMs = Number.isFinite(deps.timeoutMs) ? deps.timeoutMs : SUPERVISOR_CONFIRM_TIMEOUT_MS
+      const isRunning = deps.isRunning || (() => Boolean(kernelApi && kernelApi.running))
+      const waitProxies = deps.waitProxies || ((ms) => waitForKernelProxies(ms))
+      const pickManager = deps.pickManager
+        || (() => (managers.value || []).find((m) => m && m.enabled && m.nodes.length) || null)
+      const sessionOf = deps.session || (() => activeRuntime)
+
+      // ① 等内核就绪。★ 不能只等 `running`：proxies 是异步加载的（T05/D11），
+      //   只判 running ⇒ 内核刚起、表还空时误判为"已恢复" —— 那正是本功能要防的假成功。
+      const ready = Boolean(isRunning()) && Boolean(await waitProxies(timeoutMs))
+      if (!ready) return finishRecovery('kernel-not-ready', reason)
+
+      const target = pickManager()
+      if (!target) return finishRecovery('no-manager', reason)
+      const session = sessionOf()
+      if (!isSessionUsable(session)) return finishRecovery('no-session', reason)
+
+      // ② 探一轮。★ 只走快检（探当前节点），不做全池轮：
+      //   全池轮最坏 N×timeout，拿它当"确认"太重，确认本身不该成为新的负担。
+      const before = Number(target.probeRoundOutputs) || 0
+      await target.tickCurrent(session)
+      const produced = (Number(target.probeRoundOutputs) || 0) > before
+      return finishRecovery(produced ? 'confirmed' : 'no-probe-output', reason, target)
+    } catch (err) {
+      return finishRecovery('error', reason)
+    } finally {
+      RUNTIME_SUPERVISOR.recovering = false
+    }
+  }
+
   const asyncPool = async (limit, list, iterator) => {
     const results = []
     let index = 0
@@ -1085,6 +1913,16 @@ export default (Plugin) => {
       this.timer = null
       this.initialTimer = null
       this.checking = false
+      // T05m：本轮探测的起始时刻。监督器靠它认出「卡在某一轮里出不来」这种死法
+      //   （只看 lastCheckedAt 会被 !checking 守卫挡住，而挂死恰恰是最需要恢复的情形）。
+      this.checkingSince = 0
+      // v6.2/P6-1：快检真正**产出过探测结果**的次数（成功与失败都算，早退不算）。
+      //   为什么不能用 `currentTickCount`：它在 tickCurrent **入口**就 +1，早退也涨 ⇒
+      //   拿它当「恢复确认」的判据，会把「被挡在门外」读成「已经恢复了」（假成功）。
+      // ★ 读取方是 confirmRuntimeRecovery 里的 `target.probeRoundOutputs`（不是 `this.` 形式）
+      //   ⇒ `_tools/audit-fields.cjs` 只认 `this.` 读点，会把它报成"死字段"—— 那是误报，
+      //   真实读取点在恢复确认里，且结论经 supervisorNote 上屏（不是只写不读）。
+      this.probeRoundOutputs = 0
       this.switching = false
       this.enabled = this.groupConfig.enabled !== false
       this.current = null
@@ -1104,6 +1942,25 @@ export default (Plugin) => {
       this.switchHistory = []
       this.lastFailoverAt = 0
       this.lastRoundCostMs = 0
+      // ---- T05e/P0-②：手动选择状态 ----
+      // nodeId = 用户在面板手动选中的节点；until = 保护窗口到期时刻（epoch ms）。
+      // 只在 switchTo 的「手动」分支写入；evaluateSwitch 据此跳过「发现更优节点」这条路径。
+      // ★ 空态必须是 `{ nodeId: null, until: 0 }` 而不是 null —— 下面的判据一律先读字段，
+      //   给 null 会让它退化成需要到处 `|| {}` 兜底（本项目最忌讳的隐身失效）。
+      this.manualSelection = { nodeId: null, until: 0 }
+      // ---- T05f/P0-②：插件自己上一次的切换落点 ----
+      // 用途：**唯一**用来把「插件自己刚切过去」与「用户在宿主 App 里切了」区分开的证据。
+      //   没有它，syncExternalState 一见「当前节点变了」就写 manualSelection ⇒ 插件的自动切换
+      //   会把自己刚切到的节点锁住（后续再也切不动）⇒ 把「尊重用户」修成「调度自锁」——比原缺陷更坏。
+      // 空态必须是 null（而不是 `{nodeId:null}`）：null 的语义是「从未切过」，判据此处直接放行。
+      this.lastAppliedTarget = null
+      // ---- T05g：跨拍观测的「上一拍看到谁」 ----
+      // 为什么必须持久化：旧判据是 `previousCurrent !== nextCurrent`，而这两个值相隔 0ms、
+      //   且来自同一来源（`currentNodeName()` 优先读直读缓存，refreshCandidatePool 又不更新它）
+      //   ⇒ 直读缓存一旦存在就**恒等** ⇒ 调度运行中永远检测不到外部变化（探针实测 confirmed）。
+      // 跨拍对比才能看见"用户在我们两次观测之间动过手"。
+      // 空态必须是 null：null 的语义是「还没观测过」，首次观测**只写不判**（避免启动即误报）。
+      this.lastObservedCurrent = null
       // ---- T04：当前节点快检 ----
       this.currentTimer = null
       this.currentTicking = false
@@ -1140,12 +1997,52 @@ export default (Plugin) => {
       this.roundWatchFrom = 0
       this.roundStaleNote = ''
       this.roundStaleNotifiedAt = 0
+      // ---- T05i：候选组的类型（内核返回）----
+      // 用途：非 Selector 的组（URLTest / Fallback / LoadBalance）内核**不会接受**手动指定，
+      //   面板却照样给「使用」按钮 ⇒ 点了必然失败。记下来以便给出**提示**（不是硬拦，见 handleManualSwitch）。
+      this.kernelTypeMap = new Map()
+      // ---- T05i：全局预算拒绝的本地留痕 ----
+      // 闸门是跨 Manager 的模块级单例，但「本组这一拍为什么没探」必须落到**本组**的读数上，
+      //   否则用户在某一张卡上只能看到 `-` 而拿不到原因（同一个静默早退坑）。
+      this.probeBudgetRejects = 0
+      this.probeBudgetNotifiedAt = 0
+      // ---- T05k/P0-1：切前体检的留痕计数 ----
+      // 计数而非布尔：harness 够不着宿主的一次性弹条，只有这个能证明"到底提示了没有"。
+      this.switchRiskCount = 0
+      this.lastSwitchRisk = ''
     }
 
     addLog(level, message) {
-      const item = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, time: Date.now(), level, message }
+      const safe = redact(message)
+      const item = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, time: Date.now(), level, message: safe }
       this.logs = [item, ...this.logs].slice(0, this.options.logLimit || 120)
-      console.log(`[${Plugin.name}][${this.policyGroup}]`, message)
+      console.log(`[${Plugin.name}][${this.policyGroup}]`, safe)
+      this.persistLogEntry(level, safe)
+    }
+
+    // v6.0：把这一条交给落盘队列（只落 warn/error；节流 + 封顶 + 全程静默降级）。
+    // ★ 传 `safe`（已过 redact）而不是原始 `message` —— 落盘件是长期留存物，
+    //   绝不能把订阅 URL / token / secret 写进磁盘。
+    // ★ 绝不 await、绝不抛出：落盘失败最多损失取证材料，抛出去会让整轮巡检挂掉。
+    persistLogEntry(level, safeMessage) {
+      try {
+        return logPersistEnqueue(level, safeMessage, this.policyGroup, this.options)
+      } catch (_) {
+        return false
+      }
+    }
+
+    // T05i：全局预算耗尽的留痕。限频 60s（与预算窗口同量级）——
+    // 16 组同时撞闸门时，不限频就是每 30s 十六条，会把真正的异常淹掉（同 T04 的限频纪律）。
+    // ★ 只留痕、不计节点失败：预算是**我们自己的**约束，不是节点的过错。
+    noteProbeBudgetExhausted(kind) {
+      const now = Date.now()
+      this.probeBudgetRejects += 1
+      const detail = PROBE_BUDGET.lastRejectReason || '全局探测预算已用尽'
+      this.lastCurrentNote = `${detail}（本拍未探测，不计入节点失败）`
+      if (now - this.probeBudgetNotifiedAt < 60000) return
+      this.probeBudgetNotifiedAt = now
+      this.addLog('warn', `${detail} —— ${kind === 'current' ? '当前节点快检' : '全池巡检'}本轮跳过，不计入节点失败统计`)
     }
 
     // T03/M9：控制面（内核 clash_api）不可达时的留痕。限频 5 分钟，避免刷屏。
@@ -1221,6 +2118,10 @@ export default (Plugin) => {
       // 心跳计数**不清**：它是「曾经跑过多少拍」的证据，停后仍有诊断价值（与 logs 同理）。
       this.kernelNowMap = new Map()
       this.kernelNowFailures = 0
+      // T05g：跨拍观测基线一并清掉。停机期间没有观测通道（面板也可能关着），
+      // 留着停机前的值会让重启后第一拍把「停机期间累积的变化」当成一次外部选择 —— 那是误报。
+      // 清成 null ⇒ 重启后第一拍走 'first' 分支，只建基线不判变化（与 kernelNowMap 同样的纪律）。
+      this.lastObservedCurrent = null
     }
 
     refreshCandidatePool() {
@@ -1301,6 +2202,7 @@ export default (Plugin) => {
         return
       }
       this.checking = true
+      this.checkingSince = Date.now()
       const startedAt = Date.now()
       try {
         // T05a：与 tickCurrent 同一纪律 —— 先取内核真值，再算候选池。
@@ -1339,6 +2241,7 @@ export default (Plugin) => {
           this.addLog('info', `单轮耗时 ${Math.round(this.lastRoundCostMs / 1000)}s，已超过检测间隔 ${Math.round(this.options.monitoringInterval / 1000)}s，实际节奏会变慢`)
         }
         this.checking = false
+        this.checkingSince = 0
         if (isSessionUsable(session)) this.onUpdate()
       }
     }
@@ -1423,7 +2326,13 @@ export default (Plugin) => {
       const token = node.beginProbe({ kind: 'full', generation: session.id, managerGeneration: this.managerGeneration })
       const results = {}
       let controlPlaneFailures = 0
+      let budgetRejects = 0
       await asyncPool(this.options.serviceConcurrency, this.services, async (service) => {
+        // T05i：全局探测预算闸门。**拒绝 = 不发起**，而不是"发起后算失败"。
+        if (!claimProbeSlot(this.options.globalProbeBudget, this.options.globalProbeWindowMs)) {
+          budgetRejects += 1
+          return
+        }
         try {
           const delay = await requestDelay(node.id, service.url, this.options.requestTimeout, session.controller.signal)
           results[service.key] = { ok: true, delay }
@@ -1443,6 +2352,13 @@ export default (Plugin) => {
         this.noteControlPlaneDown()
         return
       }
+      // T05i：★ 只要有一次被预算拦下就**整个节点不记账**。
+      //   半套结果比没有结果更坏：只探到 1/3 服务就写指标，会把「我们没探」算成「节点答不上来」
+      //   ⇒ 成功率被拉低 ⇒ 触发假故障切换。宁可整轮跳过，也不要用残缺数据污染指标。
+      if (budgetRejects > 0) {
+        this.noteProbeBudgetExhausted('full')
+        return
+      }
       node.recordProbe(token, results, this.services, session.id, this.managerGeneration)
     }
 
@@ -1453,6 +2369,28 @@ export default (Plugin) => {
       const now = Date.now()
       this.switchHistory = this.switchHistory.filter((time) => now - time < 3600000)
       return this.switchHistory.length < this.options.maxSwitchPerHour
+    }
+
+    // ---- T05e/P0-②：手动选择保护窗口判据 ----
+    // 三条硬性语义，缺一即退化为「故障时不自愈」或「永久锁死自动调度」：
+    //   ① 只保护**用户手动选中的那一个节点** —— 当前节点一旦不是它（已被故障切走、拓扑变化、
+    //      用户又点了别的），窗口立即失效。否则「尊重用户」会变成「一个过期意图长期绑架调度」；
+    //   ② 到期即失效（until <= now ⇒ false），不做任何隐式续期；
+    //   ③ 只被 evaluateSwitch 的**性能优化**路径读取。故障路径（isCurrentDead / failoverFromCurrent）
+    //      在调用点之前，永远不受它影响。
+    isManualSelectionProtected(nodeId = '') {
+      const selection = this.manualSelection
+      if (!selection || !selection.nodeId) return false
+      if (!Number.isFinite(selection.until) || Date.now() >= selection.until) return false
+      return selection.nodeId === nodeId
+    }
+
+    // T05e/P0-②：保护窗口的**人话读数**（面板卡片用）。
+    // 没有它，用户只能从日志里猜「为什么我选的节点被/没被换掉」。
+    manualProtectText() {
+      if (!this.isManualSelectionProtected(this.currentNodeName())) return ''
+      const left = Math.max(0, Math.round((this.manualSelection.until - Date.now()) / 60000))
+      return `保护中（约 ${left} 分钟）`
     }
 
     // ---- T05：全池轮停滞自检 ----
@@ -1479,6 +2417,59 @@ export default (Plugin) => {
     // ---- T04/M5：当前节点快检（第二条探测通道）----
     // 与全池轮的关系：工作集不重叠（全池轮按候选池抽样，这里只打当前节点），
     // 因此**不互斥**（互斥只会白丢检测轮次）。与在途切换只做必要隔离：快检不得覆盖切换结果。
+    // ★ 关键：不能只看 `lastCheckedAt`。若一轮探测**挂死**（checking 恒为 true），
+    //   那才是最需要恢复的情形，而只看 lastCheckedAt 会被 `!checking` 守卫挡在门外
+    //   ⇒ 监督器必须同时认得「一直没出结果」和「卡在某一轮里出不来」这两种死法。
+    superviseVerdict() {
+      if (!this.enabled) return 'skip-disabled'
+      if (!isSessionUsable(this.session)) return 'skip-stopped'
+      const interval = Math.max(60000, Number(this.options.monitoringInterval) || 0)
+      const factor = Math.max(2, Number(this.options.supervisorStaleFactor) || 4)
+      const since = this.checking && this.checkingSince
+        ? this.checkingSince
+        : (this.lastCheckedAt || this.roundWatchFrom)
+      if (!since) return 'ok'
+      const idle = Date.now() - since
+      if (idle <= interval * factor) return this.checking ? 'skip-checking' : 'ok'
+      return 'stale'
+    }
+
+    // 执行侧：调决策、按结果动作、无论哪种结果都留痕。
+    superviseTick() {
+      const verdict = this.superviseVerdict()
+      if (verdict !== 'stale') return
+      const interval = Math.max(60000, Number(this.options.monitoringInterval) || 0)
+      const factor = Math.max(2, Number(this.options.supervisorStaleFactor) || 4)
+      const reason = `全池轮停滞超过 ${factor}× 间隔（${Math.round((interval * factor) / 60000)} 分钟）`
+      const plan = planRuntimeRestart(reason, this.options.supervisorMaxRestarts, this.options.supervisorCooldownMs)
+      if (plan === 'restarted') {
+        commitRuntimeRestart()
+        this.addLog('warn', `${reason}：触发运行时自动重启（第 ${RUNTIME_SUPERVISOR.restarts}/${this.options.supervisorMaxRestarts} 次）`)
+        try {
+          stop(true, true)
+          // ★ v6.2/P6-1：必须等 start() 完成再确认 —— managers.value 是在 startRuntime
+          //   **末尾**才被替换的，不等就去确认 ⇒ 对着**已经作废的旧 Manager** 探一轮。
+          //   确认走异步，绝不阻塞本拍快检。
+          Promise.resolve(start()).then(
+            () => confirmRuntimeRecovery(reason),
+            (err) => this.addLog('warn', `运行时自动重启失败：${err?.message || String(err)}`)
+          ).catch(() => {})
+        } catch (err) {
+          this.addLog('warn', `运行时自动重启失败：${err?.message || String(err)}`)
+        }
+        return
+      }
+      // ★ 被闸门拦下同样要留痕 —— 静默地"不动作"与静默地"没运行"在运维侧无法区分。
+      if (Date.now() - RUNTIME_SUPERVISOR.notifiedAt < 600000) return
+      RUNTIME_SUPERVISOR.notifiedAt = Date.now()
+      const why = plan === 'blocked:disabled'
+        ? '监督已关闭（supervisorMaxRestarts = 0）'
+        : plan === 'blocked:limit'
+          ? `已达重启上限 ${this.options.supervisorMaxRestarts} 次`
+          : '冷却期内'
+      this.addLog('warn', `${reason}：监督器未执行重启（${why}）`)
+    }
+
     async tickCurrent(session = this.session, opts = {}) {
       // T05d：preview = 预览态单次检测。与 runtime 的差别**只有两点**：不计心跳、禁止故障切换。
       //   其余（读内核真值 → 算候选池 → 探测当前节点 → 写指标）完全同源，避免出现两套口径（D7 同类问题）。
@@ -1504,9 +2495,14 @@ export default (Plugin) => {
         this.lastCurrentTickAt = Date.now()
       }
       this.lastCurrentNote = ''
-      // T05：全池轮停滞自检。放在这里是因为快检是唯一"每 30s 必然跑一次"的通道。
+      // ---- T05m：监督器判定"整条通道是否真的停摆" ----
+    // T05：全池轮停滞自检。放在这里是因为快检是唯一"每 30s 必然跑一次"的通道。
       // 预览态既没有定时器也没有全池轮，不做停滞判定（否则一进面板就误报"全池轮已停滞"）。
-      if (!preview) this.checkRoundWatchdog()
+      if (!preview) {
+        this.checkRoundWatchdog()
+        // T05m：借道快检做**恢复**（不只是报告）。快检是唯一每拍必然跑的通道。
+        this.superviseTick()
+      }
       try {
         // T05a：★ 顺序不能反 —— 必须先取内核真值，再算候选池。
         //   refreshCandidatePool 用 policyGroup.now 定 routeTarget，用 Store 的旧值会算错候选组；
@@ -1523,6 +2519,18 @@ export default (Plugin) => {
         }
         const current = this.nodeMap.get(this.currentNodeName()) || null
         this.current = current
+        // ---- T05g：借道快检做跨拍观测（外部选择的第二条通道）----
+        // 为什么必须借这条：`syncExternalState` 的唯一调用点 `syncManagersFromKernel`
+        //   只在面板 onMounted 里跑一次 + 一个 3s 定时器，而那个定时器在 **afterClose 就被清掉**
+        //   ⇒ 「调度在跑但面板已关」这个主场景下，外部选择根本没人去检测（改了 lastObservedCurrent 也白改）。
+        //   快检是唯一每 currentCheckInterval(30s) 必然跑一次的通道（T05 的 watchdog 就是这么借的）。
+        // ★ 只调 observeCurrent，**不调 syncExternalState**：
+        //   - 后者会顺手清 `lastPlanText`（巡检进度，面板要用），运行时被一次外部变化清掉是越权；
+        //   - 这里也不需要重算候选池（上面刚算过），不增加任何内核请求
+        //     （13 组 × 每 3s 全量直读会把内核打爆，这条硬约束不能破）。
+        // ★ silent = false：真的检测到外部变化时**必须留痕**（一条从不触发的检测留着就是死的）。
+        //   观察值立即回写 ⇒ 同一变化只报一次，不会每 30s 刷屏。
+        this.observeCurrent(this.currentNodeName(), false)
         if (!current) {
           // T05d/P0-1：「拓扑未就绪」与「真的找不到该节点」是两件事，读数必须能区分开。
           this.lastCurrentNote = /未就绪/.test(this.lastReason)
@@ -1541,6 +2549,14 @@ export default (Plugin) => {
         //   不会因为熔断期照探而反复切换（下面还有一层冷却窗口内的静默短路）。
         const wasCircuitOpen = current.state !== 'CLOSED'
         if (wasCircuitOpen) this.lastCurrentNote = `节点熔断中（${current.state}），照探等待恢复`
+
+        // T05i：全局探测预算闸门（与全池轮共用同一份配额 —— 要管的正是两条通道的**叠加**）。
+        // ★ 心跳已在上面计数：这一拍确实交到了 tickCurrent，只是没发出探测。
+        //   若不计数才是对用户的误导（把"被预算拦下"显示成"通道没跑"）。
+        if (!claimProbeSlot(this.options.globalProbeBudget, this.options.globalProbeWindowMs)) {
+          this.noteProbeBudgetExhausted('current')
+          return
+        }
 
         const token = current.beginProbe({ kind: 'current', generation: session.id, managerGeneration: this.managerGeneration })
         let result = null
@@ -1578,6 +2594,7 @@ export default (Plugin) => {
         }
         if (result.ok) {
           current.recordCurrentProbeSuccess(result.delay)
+          this.probeRoundOutputs += 1
           // T05d：粘性读数 —— 供候选池被清空时面板仍能显示"最近一次测到多少"。
           this.lastKnownDelay = result.delay
           this.lastCurrentNote = ''
@@ -1592,7 +2609,9 @@ export default (Plugin) => {
           return
         }
 
+        // ★ 失败也是"产出"：通道活着但节点不通，与"通道根本没探"是两回事。
         const consecutive = current.recordCurrentProbeFailure(this.options.currentFailureWindow)
+        this.probeRoundOutputs += 1
         // ★ 只在「刚越过阈值」那一拍出声，之后静默；恢复时由上面的 success 分支出声。
         //   为什么不能每拍都报：16 组 × 每 30s ⇒ 每 2 秒一条，会把真正的异常淹掉。
         //   「快检有没有在跑」的可观测性改由面板「快检心跳」卡片承担（T05c）。
@@ -1743,8 +2762,22 @@ export default (Plugin) => {
 
       const isCurrentDead = !current.isAvailable() || current.successRatio < this.options.minSwitchSuccessRatio
 
+      // ★ 顺序不能反：故障分支必须在保护窗口判据**之前**。
+      //   手动选择的节点真的挂了 ⇒ 照常自愈切走。保护的是「用户的偏好」，不是「用户的故障」。
       if (isCurrentDead) {
         await this.failoverFromCurrent(session, `当前节点故障(可用率 ${Math.round(current.successRatio * 100)}%)，触发紧急自愈切换`)
+        return
+      }
+
+      // ---- T05e/P0-②：尊重手动选择 ----
+      // 旧版没有任何手动选择状态 ⇒ 用户点「使用」选中的节点只靠 minSwitchInterval(默认 900s)
+      // 兜底：15 分钟后只要它分数不是最高，就被自动切回最优节点 —— 手动选择等于"延时 15 分钟作废"。
+      // 这里在保护窗口内**只跳过「发现更优节点」这条性能优化路径**。
+      // 注意不要顺手把 lastSwitchAt 也跳过：冷却防抖照旧（防用户连点），只是不"择优推翻"。
+      if (this.isManualSelectionProtected(current.id)) {
+        const leftMinutes = Math.max(1, Math.ceil((this.manualSelection.until - now) / 60000))
+        this.lastReason = `手动选择 ${current.id} 保护中（剩余约 ${leftMinutes} 分钟）：不因分数更优而切换（最优候选 ${best.id}）；该节点故障仍会自愈`
+        this.addLog('info', this.lastReason)
         return
       }
 
@@ -1809,15 +2842,49 @@ export default (Plugin) => {
     //
     // T03/M4：升级为四阶段事务 prepare → execute → verify → commit。
     // 已被占用时不丢弃请求，改入 pendingSwitch 排队（旧版直接 return false 丢失一次故障自救机会）。
-    async switchTo(node, reason, session = this.session) {
-      // ★ 手动切换（面板点节点行）不隶属任何运行代际：预览态下 manager.session 为 null，
-      //   若一律按 isSessionActive 拦，手动切换会静默失效（回归）。因此显式区分「无代际的手动切换」。
-      const manual = !session
+    async switchTo(node, reason, session = this.session, opts = {}) {
+      // ★ 手动切换（面板点节点行）的判据 —— T05e 起是**两条**，缺一不可：
+      //   ① `!session`：预览态下 manager.session 为 null。若一律按 isSessionActive 拦，
+      //      手动切换会静默失效（回归）。这是 T03 的旧判据，保留。
+      //   ② `opts.manual === true`：**调度正在跑**时 manager.session 非 null，
+      //      旧判据会把用户点的「使用」误判成自动切换 ⇒ 手动选择既不被尊重（P0-②），
+      //      又会吃掉每小时额度（P0-③）。这两条 P0 是同一处的两个面，因此必须共用这一个标记，
+      //      绝不在两处各判一次（判据一分叉就必然漂移）。
+      const manual = !session || opts.manual === true
       const sessionValid = () => (manual ? true : isSessionUsable(session))
       const txValid = () => (manual ? tx.seq === this.activeSwitchSeq : this.isSwitchValid(tx, session))
 
       if (!sessionValid()) return false
       if (!node) return false
+      // ---- T05j：只读观察名单（唯一收口）----
+      // 放在这里而不是 evaluateSwitch / failoverFromCurrent：那两条只是「决定切不切」，
+      // 而面板手动点的「使用」不经过它们 —— 挡在 switchTo 才能**一处全覆盖**。
+      // ★ 只挡切换，检测照跑（观察模式的价值就是「看见但不动手」）。
+      if (isObserveOnly(this.policyGroup)) {
+        this.lastReason = `${this.policyGroup} 处于只读观察模式：只检测、不切换（本次目标 ${node.id}）`
+        this.addLog('info', `${this.lastReason}${reason ? ` · 触发原因：${reason}` : ''}`)
+        return false
+      }
+
+      // ---- T05k/P0-1「切前检查目标可切换性」----
+      // 外部审查三次都要求 switchTo 事务化。逐条核对后：**切中锁**（activeSwitchSeq / isSwitchValid）
+      //   与**切后验证**（waitForApplied + tx.phase=verify/commit + 回读 now===target）**都已存在**，
+      //   唯独「切换前检查目标存在 / 未熔断 / 已探测」这一条是**真缺口**。
+      // ★ 自动路径其实已有保护：`evaluateSwitch` 用 `successRatio >= minSwitchSuccessRatio`
+      //   过滤候选，熔断中的节点成功率必然不达标 ⇒ 选不到。真正裸奔的是**面板手动点的「使用」**：
+      //   用户能点到一个熔断中、或从未探测过的节点，而旧版对此**零提示**（点了没反应，也不知道为什么）。
+      // ★ 为什么是**软**拦截（留痕 + 提示，仍发起），不是硬拒：
+      //   ① 手动切换是用户的**显式意图**，硬拦 = 越权替用户做决定；
+      //   ② 熔断是「我们上次测出来的结论」，不是「现在一定不可用」—— 拿旧结论写死拒绝，
+      //      就是把「不知道」当成「不可能」（MEMORY 2.10g）；
+      //   ③ 真失败由既有兜底处理（waitForApplied 回读不到 ⇒ 返回 false ⇒ 弹「切换未生效」）。
+      const targetRisk = this.describeSwitchRisk(node)
+      if (targetRisk) {
+        this.switchRiskCount += 1
+        this.lastSwitchRisk = `${reason ? `${reason}：目标 ${node.id}` : `目标 ${node.id}`} —— ${targetRisk}（仍按你的操作提交，失败会照常提示）`
+        this.addLog('warn', this.lastSwitchRisk)
+        Plugins.message.info(this.lastSwitchRisk)
+      }
 
       const previous = this.currentNodeName()
       // 目标已是当前节点：宿主会静默忽略，这里也直接短路。关键是**不能写切换冷却**，
@@ -1840,7 +2907,10 @@ export default (Plugin) => {
         managerGeneration: this.managerGeneration,
         phase: 'prepare',
         reason,
-        isFailover
+        isFailover,
+        // T05e/P0-②③：手动标记随事务走 —— 排队的切换被消费时必须**继承**它，
+        //   否则一个被插队/延后执行的手动切换会在落地时被误判成自动切换（额度与保护窗口双双错位）。
+        manual
       }
 
       if (this.switching) {
@@ -1914,7 +2984,27 @@ export default (Plugin) => {
         node.resetCurrentProbe()
         this.lastSwitchAt = switchedAt
         if (isFailover) this.lastFailoverAt = switchedAt
-        this.switchHistory.push(switchedAt)
+        // ---- T05e/P0-③：手动切换**不写入** switchHistory ⇒ 不消耗每小时额度 ----
+        // 旧版手动切换也 push ⇒ 用户点几次「使用」就把 maxSwitchPerHour 吃光 ⇒
+        // 真故障时 failoverFromCurrent / evaluateSwitch 走到 `!this.canSwitch()` 直接返回 false，
+        // 紧急自愈被跳过（只有一条 warn 日志，面板上根本看不见）。这是"越用越危险"的坏结构。
+        // 保留的东西（都是防抖，不是额度）：
+        //   lastSwitchAt —— 冷却防抖，防用户连点；
+        //   candidatePoolSwitchMap —— 共享池防抖。
+        if (!manual) this.switchHistory.push(switchedAt)
+        // ---- T05e/P0-②：写入手动选择保护窗口 ----
+        // manualProtectWindow = 0 ⇒ until 立刻到期 ⇒ 判据恒 false ⇒ 等价于关闭保护。
+        if (manual) {
+          this.manualSelection = { nodeId: node.id, until: switchedAt + (Number(this.options.manualProtectWindow) || 0) }
+        }
+        // ---- T05f/P0-②：记录本次落点 ----
+        // 这是 syncExternalState 区分「自己切的」与「用户在宿主 App 里切的」的唯一凭据。
+        // ★ 无论 manual 与否都要记 —— 自动切换同样不能被误判成外部选择（否则自动切换会自锁）。
+        this.lastAppliedTarget = { nodeId: node.id, at: switchedAt, manual }
+        // ---- T05g：同步跨拍观测基线 ----
+        // ★ 必须写：否则插件自己的切换会在下一拍被 observeCurrent 当成"用户在外部改了"，
+        //   于是给刚切过去的节点上保护 ⇒ 自动切换自锁（与 lastAppliedTarget 是同一件事的两道保险）。
+        this.lastObservedCurrent = node.id
         // T05/D6：顺手回收过期键（旧版只写不删）
         prunePoolSwitchMap(switchedAt)
         candidatePoolSwitchMap.set(this.candidateGroup, switchedAt)
@@ -1943,7 +3033,8 @@ export default (Plugin) => {
       if (this.currentNodeName() === next.target) return
       const node = this.nodeMap.get(next.target)
       if (!node) return
-      this.switchTo(node, next.reason, session).catch(() => {})
+      // T05e/P0-②③：把排队的 manual 标记传下去（见 switchTo 里 tx.manual 的注释）。
+      this.switchTo(node, next.reason, session, { manual: next.manual === true }).catch(() => {})
     }
 
     // ---- T05a：运行期直读内核 now ----
@@ -1959,9 +3050,12 @@ export default (Plugin) => {
         if (hasSession && !isSessionUsable(session)) return { ok: false }
         if (!result.ok) return { ok: false }
         this.kernelNowMap.set(group, result.now || '')
+        // T05i：顺手记下组类型（零额外请求）。真机 19 组里有 1 个 URLTest（🎈 自动选择，96 成员），
+        // 它的「使用」按钮点了必然失败 —— 记下类型才能给用户提示，而不是让他对着静默失败发呆。
+        if (result.type) this.kernelTypeMap.set(group, result.type)
         this.kernelNowAt = Date.now()
         this.kernelNowFailures = 0
-        return { ok: true }
+        return { ok: true, type: result.type || '' }
       } catch (error) {
         if (error?.cancelled) return { ok: false, cancelled: true }
         this.kernelNowFailures += 1
@@ -2026,19 +3120,110 @@ export default (Plugin) => {
       return kernelApi.proxies[group]?.now || ''
     }
 
+      // T05k/P0-1：目标的「可切换性」体检。返回 '' = 无风险；否则返回**人话**的风险描述。
+    // 三条判据按「用户最需要知道」排序（熔断 > 从未探测 > 可用率不达标），只报第一条。
+    // ★ 只在**有确凿证据**时开口：读不到的一律返回 '' —— 「不知道」绝不当成「有风险」（MEMORY 2.10g）。
+    describeSwitchRisk(node) {
+      if (!node) return ''
+      if (typeof node.state === 'string' && node.state === 'OPEN') {
+        return `该节点处于熔断状态（${node.state}），上次探测判定不可用`
+      }
+      // ★ 只在 `lastChecked === 0`（**确凿**从未探测）时开口；`undefined` 是「未知」不是「从未」。
+      //   把未知当确凿 ⇒ 数据缺失时一律报警（MEMORY 2.10g：真值表必须区分「确凿为否」与「未知」）。
+      if (node.lastChecked === 0) {
+        return '该节点从未被探测过，健康状况未知'
+      }
+      const ratio = Number(node.successRatio)
+      const floor = Number(this.options.minSwitchSuccessRatio)
+      if (Number.isFinite(ratio) && Number.isFinite(floor) && ratio < floor) {
+        return `该节点可用率 ${Math.round(ratio * 100)}% 低于阈值 ${Math.round(floor * 100)}%`
+      }
+      return ''
+    }
+
+    // 候选组类型。直读缓存优先（内核权威），回落宿主 Store（面板打开时它也是新鲜的）。
+    // 读不到就返回 '' —— 由调用方按"未知"处理，**绝不猜**（MEMORY 2.10g）。
+    groupTypeOf(name = this.candidateGroup) {
+      if (!name) return ''
+      const fresh = this.kernelTypeMap.get(name)
+      if (typeof fresh === 'string' && fresh) return fresh
+      return String(kernelApi.proxies?.[name]?.type || '')
+    }
+
     syncExternalState(silent = false) {
       const previousRoute = this.routeTarget
       const previousPool = this.candidateGroup
       const previousCurrent = this.currentNodeName()
       this.refreshCandidatePool()
       const nextCurrent = this.currentNodeName()
-      const changed = previousRoute !== this.routeTarget || previousPool !== this.candidateGroup || previousCurrent !== nextCurrent
+      // ★ 三项判据（routeTarget / candidateGroup / current）保持原样 —— 拓扑重组的检测逻辑不动。
+      let changed = previousRoute !== this.routeTarget || previousPool !== this.candidateGroup || previousCurrent !== nextCurrent
       if (changed && !silent) {
         this.lastReason = `检测到外部选择变化：${previousRoute || '-'} -> ${this.routeTarget || '-'}`
         this.lastPlanText = ''
         this.addLog('info', `${this.lastReason}，当前节点 ${nextCurrent || '-'}`)
       }
+      // ---- T05f/T05g：外部选择这一维改用「跨拍观测」----
+      // 为什么必须换判据：上面的 `previousCurrent !== nextCurrent` 是相隔 0ms 的两次同源读取，
+      //   直读缓存存在时恒等 ⇒ 调度运行中这条**永远是 false**（探针实测）。留着它等于没有检测。
+      // 换成与上一拍留存值对比之后，同一变化**只会被报一次**（observeCurrent 立即回写），不会刷屏。
+      // ★ 用 `||=` 语义追加，不改动上面三项判据本身。
+      if (this.observeCurrent(nextCurrent, silent) === 'detected') changed = true
       return changed
+    }
+
+    // T05g：跨拍观测 —— 外部选择的**唯一可靠**判据。
+    //
+    // 返回 'first'（首次观测，只写不判）/ 'unchanged'（没变）/ 'detected'（真的变了）。
+    //
+    // ★ 补强一（空值守卫）：`nodeId` 为空时**既不判定也不回写**。
+    //   refreshCandidatePool 的 D12 分支（拓扑未就绪）会清空 nodeMap，此时 currentNodeName()
+    //   返回空串。把空值当「外部变化」写入 manualSelection = 把「不知道」当成「用户选了空」；
+    //   回写空串更糟 —— 下一拍恢复后会再误报一次变化。因此为空时直接跳过，
+    //   保留上一次的 lastObservedCurrent 不变（MEMORY：不要用空值覆盖真值）。
+    //
+    // ★ 只报一次：判定后**立即**回写 lastObservedCurrent，同一变化不会在下一拍重复触发。
+    observeCurrent(nodeId, silent = false) {
+      if (!nodeId) return 'unchanged'
+      const previous = this.lastObservedCurrent
+      this.lastObservedCurrent = nodeId
+      // 首次观测：只建立基线，不判变化 —— 否则「插件刚启动」会被当成「用户改了出口」。
+      if (previous === null || previous === undefined) return 'first'
+      if (previous === nodeId) return 'unchanged'
+      this.noteExternalSelection(nodeId, silent)
+      return 'detected'
+    }
+
+    // T05f/P0-②：外部选择（用户在宿主 App 代理页里改出口）的保护判定。
+    //
+    // ★ 核心难点：syncExternalState 看到的「当前节点变了」**可能是插件自己刚切过去的**。
+    //   若一律写入 manualSelection，插件的自动切换会把自己刚切到的节点锁住 ⇒ 后续再也切不动
+    //   ⇒ 把「尊重用户」修成「调度自锁」，比原缺陷严重得多。因此先用 lastAppliedTarget 排除自己。
+    //
+    // 写入条件（两条同时成立）：
+    //   ① 不是「插件自己的落点」，**或**距那次落地已超过沉降窗口 ——
+    //      后者不可省：宿主 Store / 内核 now 的刷新有滞后，插件刚落地时两边的读数可能还不一致。
+    //      窗口取 max(5000, monitoringInterval)：比「切换确认最长耗时」宽，比「两轮巡检间隔」窄，
+    //      恰好覆盖 Store 滞后这一段。过了这个窗口还指向同一落点 ⇒ 视为用户再次确认，正常保护。
+    //   ② manualProtectWindow > 0（=0 等价于关闭：until 立即到期，写不写都一样，显式跳过省一次日志）
+    //
+    // ★ 刻意**不写** lastSwitchAt：那是插件自己的振荡防抖（minSwitchInterval）。
+    //   用户在 App 里切一次，不该把插件的振荡保护顶掉 —— 否则「手动改一次出口」
+    //   换来的是「15 分钟内插件不再自愈」，等于拿 P0-② 换出一个新的静默罢工。
+    // ★ 刻意**不写** candidatePoolSwitchMap：共享池防抖同理，理由与上一条完全一致。
+    // ★ 也不写 switchHistory：外部切换不是插件的动作，不该消耗它的每小时额度（与 manual 同一口径）。
+    noteExternalSelection(nodeId, silent = false) {
+      const protectWindow = Number(this.options.manualProtectWindow) || 0
+      if (protectWindow <= 0) return false
+      const applied = this.lastAppliedTarget
+      const settleWindow = Math.max(5000, Number(this.options.monitoringInterval) || 0)
+      // ① 排除「插件自己刚切过去的」这个落点
+      if (applied && applied.nodeId === nodeId && Date.now() - applied.at < settleWindow) return false
+      this.manualSelection = { nodeId, until: Date.now() + protectWindow }
+      if (!silent) {
+        this.addLog('info', `尊重外部选择：${nodeId}（手动选择保护 ${Math.round(protectWindow / 60000)} 分钟内不因分数更优而切换；该节点故障仍会自愈）`)
+      }
+      return true
     }
 
     // T05d：当前节点延迟的**取值链**（把三个来源合成一个读数）。
@@ -2128,6 +3313,10 @@ export default (Plugin) => {
         totalNodes: this.nodes.length,
         lastReason: this.lastReason,
         lastPlanText: this.lastPlanText,
+        // T05e/P0-②：手动选择保护窗口的可观测面。空串 = 当前节点未被手动保护。
+        //   ★ 必须能被面板读到 —— 「我手动选的节点为什么被换掉了 / 为什么还没被换掉」
+        //   是这一条 P0 修完后用户最可能追问的问题，看不见就等于没修。
+        manualProtectText: this.manualProtectText(),
         // T04：快检通道的可观测面（验收时要能一眼看出「快检在跑、当前节点延迟多少」）
         // T05d：改为**取值链** —— 旧版只认 currentProbe（快检专有），导致两个误读：
         //   ① 候选池被清空时 this.current 变 null ⇒ 立刻掉回 `-`（像是"刚才那轮白测了"）；
@@ -2147,7 +3336,10 @@ export default (Plugin) => {
         // T05d/P0-2：预览态必须说"还没启动"，而不是"未出拍"——
         //   后者读起来是"通道坏了"，而真相是"你还没点启动"；且旧版点「立即全检」也救不了它，
         //   于是用户点得越多越确信坏了（真机 2026-09-30 用户报告）。
-        probePreview: this.probeMode !== 'runtime',
+        // T05h：★ 预览态与否**只由这一个字段承载**（旧版另有 `probePreview` 布尔量，已删）。
+        //   同一事实留两个载体，将来改一处漏一处 —— `currentTickText` 已完整编码了它
+        //   （预览态 = 「未启动（预览态）」，运行态 = 「N 拍 · M 秒前」/「未出拍」），
+        //   而 `probePreview` 全文除输出点外 0 次引用，模板与 summaryCards 都不读 ⇒ 是死字段。
         currentTickText: this.probeMode !== 'runtime'
           ? '未启动（预览态）'
           : (this.currentTickCount
@@ -2158,6 +3350,38 @@ export default (Plugin) => {
         currentStatusText: this.currentStatus(),
         // T05：全池轮停滞状态（watchdog）。空串 = 正常。
         roundStaleNote: this.roundStaleNote || '',
+        // T05m：运行时监督的可观测面。★ 自动重启是「坏了会比原故障更坏」的功能，
+        //   所以**必须让用户看见它做过什么**（重启几次 / 为什么被拦下），否则面板上只表现为
+        //   「读数突然跳一下」，与 MEMORY 2.11c 那条「接线计数骗成假 PASS」是同一个陷阱。
+        //   lastNote 只在「判定为停滞」时才被写 ⇒ 空串 = 监督器从未出手，不上屏（避免常驻噪声）。
+        supervisorNote: (() => {
+          const snap = runtimeSupervisorSnapshot()
+          if (!snap.lastNote) return ''
+          const head = snap.restarts
+            ? `已自动重启 ${snap.restarts}/${this.options.supervisorMaxRestarts} 次`
+            : (this.options.supervisorMaxRestarts ? '未执行重启' : '监督已关闭')
+          const why = snap.lastPlan === 'blocked:limit'
+            ? '（已达次数上限）'
+            : snap.lastPlan === 'blocked:cooldown'
+              ? '（冷却期内）'
+              : snap.lastPlan === 'blocked:disabled' ? '（maxRestarts = 0）' : ''
+          // v6.2/P6-1：确认结论必须上屏。★「重启过」与「重启后真的恢复了」是两件事，
+          //   只显示前者会让人以为监督器已经把问题解决（而内核可能压根没起来）。
+          const confirm = snap.lastConfirm
+            ? `；恢复确认：${RECOVERY_VERDICT_TEXT[snap.lastConfirm] || snap.lastConfirm}`
+            : ''
+          return `运行时监督：${head}${why} —— ${snap.lastNote}${confirm}`
+        })(),
+        // T05m 收尾：把两个「只写不读」的计数接上出口（字段审计报 `probeBudgetRejects` /
+        //   `switchRiskCount` 零读取）。★ 计数不上屏 = 「我拦过你几次 / 扣过你几次预算」永远看不见，
+        //   用户只能看到最终读数，无法判断是不是被闸门掐掉的 ⇒ 与「静默早退」同害。
+        guardNote: [
+          this.probeBudgetRejects ? `探测预算已拒绝 ${this.probeBudgetRejects} 次（本拍未探测，不计入节点失败）` : '',
+          this.switchRiskCount ? `切前风险提示 ${this.switchRiskCount} 次：${this.lastSwitchRisk}` : ''
+        ].filter(Boolean).join(' · '),
+        // v6.0：落盘的可观测面。★ 只在"有话要说"时非空（IO 失败 = 取证在静默丢失，
+        //   必须让用户看见）；正常/关闭态一律留空，免得常驻噪声把真告警淹掉。
+        logPersistNote: logPersistNoteText(),
         // T05/D7：决策阈值必须能从视图里读到 —— 面板的「只看健康」过滤要用**同一个数**，
         // 否则一旦阈值可调，两处立刻分叉（勾了"只看健康"却混进不合格节点）。
         minRatio: this.options.minSwitchSuccessRatio,
@@ -2288,6 +3512,8 @@ export default (Plugin) => {
     managers.value.forEach((manager, index) => manager.startMonitoring(session, index * plan.options.groupStartDelay))
     isRunning.value = true
     Plugin.status = 1
+    // v6.2/P6-2：启动标记。**不 await** —— 一次 IO 不该拖慢启动；失败由 logPersistRun 静默降级。
+    logPersistStartupMarker(plan.options)
     notifyUpdate()
     return 1
   }
@@ -2301,6 +3527,15 @@ export default (Plugin) => {
     isRunning.value = false
     if (setStatus) Plugin.status = 0
     notifyUpdate()
+  }
+
+  // v6.2/P6-2：**真实停机**路径的统一出口（写 Shutdown 标记后再停）。
+  // ★ 必须单独一个入口，不能直接改 `stop()`：startRuntime 内部「先构建后提交」那一步
+  //   也会调 `stop(false, true)`，那不是停机 —— 在那儿写 Shutdown 会每次启动都留一条假退出标记，
+  //   于是「上次是崩溃还是正常退出」这个判据被自己的噪声冲掉（判据失效比没有判据更糟）。
+  const stopWithMarker = (setStatus = true, clearManagers = false) => {
+    logPersistShutdownMarker(getOptions())
+    return stop(setStatus, clearManagers)
   }
 
   const ensurePreviewManagers = () => {
@@ -2384,8 +3619,19 @@ export default (Plugin) => {
       Plugins.message.warn('没有已启用调度的策略组')
       return
     }
-    // 手动「全检」= 一次游离会话的单轮操作，不隶属运行代际（预览态也能用）
-    await asyncPool(2, targets, (manager) => manager.checkAll(createDetachedSession()))
+    // 手动「全检」= 一次游离会话的单轮操作，不隶属运行代际（预览态也能用）。
+    // ---- T05e/P0-①：两条通道一起跑 ----
+    // 旧版只调 checkAll ⇒ 只覆盖候选池抽样，而「当前节点快检」那张卡的读数是 tickCurrent 写的
+    //   ⇒ 预览态点「立即全检」永远拿不到当前节点延迟，快检卡恒显「未启动（预览态）」。
+    //   这正是用户 2026-09-30 报告「点了半天死活不出数字」的直接原因。
+    // 为什么用 preview=true 而不是普通调用：预览态没有定时器，不该计心跳、不该做全池轮停滞判定、
+    //   更不该真的故障切换（D4 的同一原则 —— 「立即全检」是检测动作，不是接管路由）。
+    //   而 tickCurrent 的 opts.preview 在此之前是一个**零调用点的死参数**（三条分支全是死代码）。
+    // 并发度沿用既有 asyncPool(2, ...)；同组的两条通道共用同一个游离会话（同代际、同取消点）。
+    await asyncPool(2, targets, async (manager) => {
+      const session = createDetachedSession()
+      await Promise.all([manager.checkAll(session), manager.tickCurrent(session, { preview: true })])
+    })
     notifyUpdate()
   }
 
@@ -2458,7 +3704,8 @@ export default (Plugin) => {
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                 {{ showConfig ? '返回工作台' : '自定义配置' }}
               </button>
-              <button v-if="isRunning" class="ais-btn ais-btn-danger" @click="stop()">停止</button>
+              <!-- v6.2/P6-2：手动「停止」是真实停机 ⇒ 走带 Shutdown 标记的出口 -->
+              <button v-if="isRunning" class="ais-btn ais-btn-danger" @click="stopWithMarker()">停止</button>
               <button v-else class="ais-btn ais-btn-primary" @click="handleStart">启动调度</button>
               <button class="ais-btn ais-btn-accent" :disabled="checking" @click="handleCheck">
                 <svg v-if="!checking" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -2512,6 +3759,13 @@ export default (Plugin) => {
               <label class="ais-toggle-label" :title="autoStartOn ? '重载插件 / 内核重启后会自动接管调度；点击关闭' : '重载插件 / 内核重启后不会自动接管，需手动点「启动调度」；点击开启'">
                 <input type="checkbox" :checked="autoStartOn" @change="toggleAutoStart($event.target.checked)" />
                 <span>{{ autoStartOn ? '自动启动已开启' : '自动启动已关闭' }}</span>
+              </label>
+              <!-- v6.0：错误日志落盘开关。★ 这是插件里唯一会往用户磁盘写文件的功能，
+                   必须有一个用户真能改动的载体（localStorage）—— 只靠 config 键的话，
+                   宿主 plugins.yaml 会被整份回写 ⇒ 等于关不掉。 -->
+              <label class="ais-toggle-label" :title="logPersistSwitchOn ? 'warn / error 级日志会写入 data/.cache 下的日志档（用于事后取证，内容已过脱敏）；点击关闭' : '不写任何日志文件，日志只在面板内保留（插件重载即丢）；点击开启'">
+                <input type="checkbox" :checked="logPersistSwitchOn" @change="toggleLogPersist($event.target.checked)" />
+                <span>{{ logPersistSwitchOn ? '错误日志落盘：开' : '错误日志落盘：关' }}</span>
               </label>
               <div class="ais-actions">
                 <button class="ais-btn" :disabled="syncingOutbounds" title="主动从内核重新拉取出站/策略组列表（宿主自身不会定时刷新）" @click="syncOutbounds(false)">
@@ -2646,6 +3900,24 @@ export default (Plugin) => {
                 <div v-if="activeGroup.roundStaleNote" class="ais-alert is-warn">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                   <span>{{ activeGroup.roundStaleNote }} —— 快检仍在跑，但全池择优已停止更新；请确认调度仍处于运行态。</span>
+                </div>
+                <!-- T05m：运行时监督出手记录（自动重启次数 / 被闸门拦下的原因）。
+                     与上面那条停滞告警是**两件事**：停滞 = 发现问题，这条 = 我做了什么。 -->
+                <div v-if="activeGroup.supervisorNote" class="ais-alert is-warn">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                  <span>{{ activeGroup.supervisorNote }}</span>
+                </div>
+                <!-- T05m 收尾：两个此前只写不读的计数（探测预算拒绝 / 切前风险提示）接上出口。
+                     不上屏的计数等于没有计数 —— 用户看不到「是不是被闸门掐掉了」。 -->
+                <div v-if="activeGroup.guardNote" class="ais-alert is-info">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                  <span>{{ activeGroup.guardNote }}</span>
+                </div>
+                <!-- v6.0：日志落盘的失败提示。落盘是辅助功能（失败不打断调度），
+                     但"取证在静默丢失"必须让用户看得见 —— 否则又是一个静默早退。 -->
+                <div v-if="activeGroup.logPersistNote" class="ais-alert is-info">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  <span>{{ activeGroup.logPersistNote }}</span>
                 </div>
               </div>
 
@@ -2856,7 +4128,19 @@ export default (Plugin) => {
                 ? `已执行 ${g.currentTickCount} 拍；最近一拍 ${g.lastCurrentTickAt ? formatLogTime(g.lastCurrentTickAt) : '无'}；\n状态：${g.currentStatusText}；本窗口连续快检失败 ${g.fastFailCount} 次${g.roundStaleNote ? `；\n⚠️ ${g.roundStaleNote}` : ''}`
                 : '快检通道未运行'
             },
-            { label: '近 1 小时切换', value: g ? `${g.switchesLastHour} / ${g.maxSwitchPerHour} 次` : '-' }
+            { label: '近 1 小时切换', value: g ? `${g.switchesLastHour} / ${g.maxSwitchPerHour} 次` : '-' },
+            // T05e/P0-②：手动选择保护窗口。空串 ⇒ 未保护（卡片显示 '-'）。
+            // 有了这一格，用户手动点「使用」之后能立刻确认"这次选择被记住了"，
+            // 而不是等到 15 分钟后被自动切回才发现插件根本没尊重他。
+            {
+              label: '手动选择保护',
+              value: g ? (g.manualProtectText || '-') : '-',
+              title: g
+                ? (g.manualProtectText
+                    ? `当前节点是你手动选择的：性能优化切换已暂停，故障切换仍会照常自愈`
+                    : '当前节点不是手动选择的（或保护窗口已到期）：自动择优照常生效')
+                : ''
+            }
           ]
         })
 
@@ -2928,8 +4212,24 @@ export default (Plugin) => {
           // 已是当前节点：整行都绑了点击，用户选个文字就会触发，这里必须静默短路，
           // 否则会走进切换流程并写入 15 分钟冷却，把自动调度冻住。
           if (manager.currentNodeName() === nodeId) return
+          // ---- T05i：非 Selector 组的「软拦截」----
+          // 真机 19 个受管组里有 1 个 URLTest（🎈 自动选择，96 成员）。内核**不会接受**对它的手动指定，
+          // 但面板照样渲染「使用」按钮 ⇒ 点了必然失败，而旧版只会弹一句无上下文的「切换未生效」。
+          // ★ 为什么是**软**拦截（先提示、仍发起），不是硬剔除：
+          //   - 类型读不到（'' 未知）时硬剔除 ⇒ 把「不知道」当成「不可能」越权禁用了功能（MEMORY 2.10g）；
+          //   - 不同内核版本对 URLTest 的 PUT 行为并不一致，写死「必然失败」是拿猜测替代事实；
+          //   - 真失败了由既有兜底（waitForApplied 回读确认 + lastReason）处理，不会误报成功。
+          const guard = manualSwitchGuard(manager.groupTypeOf())
+          if (guard.warn) {
+            manualSwitchWarned.value += 1
+            Plugins.message.info(`候选组 [${manager.candidateGroup || manager.policyGroup}] ${guard.message}`)
+          }
           try {
-            const applied = await manager.switchTo(targetNode, '用户手动切换')
+            // T05e/P0-②③：显式标注 manual。
+            // ★ 必须传 —— 调度运行时 manager.session 非 null，switchTo 的旧判据 `!session`
+            //   会把它判成自动切换 ⇒ 手动选择不受保护（P0-②）且吃掉每小时额度（P0-③）。
+            //  session 仍按原样传（运行态下走代际校验，预览态下是 null ⇒ 走无代际分支）。
+            const applied = await manager.switchTo(targetNode, '用户手动切换', manager.session, { manual: true })
             notifyUpdate()
             if (applied) {
               Plugins.message.success(`已切换到节点: ${nodeId}`)
@@ -3011,6 +4311,28 @@ export default (Plugin) => {
         // 默认必须安全；用户显式要求时才放行，并且随时能收回来。
         const forceManagedOn = computed(() => forceManagedGroups.value.length > 0)
         const forceManagedNames = computed(() => forceManagedGroups.value.join('、') || '（无）')
+        // T05j：只读观察开关。当前只针对 GLOBAL（它是唯一被登记为「宿主保留根选择器」的组，
+        // 也是外部审查两轮都点名的争议点）。做成名单而不是布尔，是为了将来能扩到别的组。
+        // v6.1：GLOBAL 只读观察的**面板入口已移除**（2026-09-30 用户决定）。
+        //   原因：GLOBAL 已不在受管名单，开关既不会有任何可见效果，也属于「看得见、底下没人读」的错觉。
+        //   ★ 底层能力（`observeOnlyGroups` + switchTo 里那道拦截）**保留**：它落在 v6.0 冻结区里，
+        //     删它要改 switchTo，属于解冻操作，不在这次改动里做。当前它是「无入口的内部能力」，
+        //     任何组需要「只检测不切换」时可直接复用。
+
+        // ---- v6.0：错误日志落盘开关（真实可关）----
+        // 载体是 localStorage（LOG_PERSIST_KEY），不是 config：宿主 plugins.yaml 会被整份回写，
+        // 手加的键会被抹 ⇒ 只靠 config 的话这个功能「默认写用户磁盘却关不掉」。
+        // 三态：null = 没存过 ⇒ 显示/判定都回退 config 默认值（默认 1 = 开）。
+        const logPersistSwitchOn = computed(() => logPersistOn.value !== false)
+        const toggleLogPersist = (on) => {
+          setLogPersist(on)
+          Plugins.message[on ? 'success' : 'info'](
+            on
+              ? '错误日志落盘已开启：warn / error 会写入 data/.cache 下的日志档（内容已过脱敏）'
+              : '错误日志落盘已关闭：不再写任何日志文件（已落盘的旧文件会被删除）'
+          )
+          notifyUpdate()
+        }
 
         // ---- T05：自动启动开关（真实可关）----
         // 旧版四处读 `Plugin.AutoStart` 却从不定义它 ⇒ 恒真 ⇒ 界面里关不掉。
@@ -3235,6 +4557,8 @@ export default (Plugin) => {
           toggleForceManaged,
           autoStartOn,
           toggleAutoStart,
+          logPersistSwitchOn,
+          toggleLogPersist,
           configNotes,
           dragFrom,
           dropClass,
@@ -3248,6 +4572,7 @@ export default (Plugin) => {
           toggleGroup: setGroupEnabled,
           healthClass,
           stop,
+          stopWithMarker,
           async handleStart() {
             try {
               await start()
@@ -3720,7 +5045,8 @@ export default (Plugin) => {
         setTimeout(() => start().catch((error) => (lastError.value = error.message || String(error))), 1500)
       }
     },
-    onDisabled: () => stop(true, true),
+    // v6.2/P6-2：这三条是**真实停机** ⇒ 走带标记的统一出口。
+    onDisabled: () => stopWithMarker(true, true),
     // ⚠️ onReload **需要**在 App 内把 `on::reload` 勾进触发器才会被调用（未勾选 = 永不执行）。
     // 勾上它，「重载插件」这条路径才具备自恢复能力（D10 的另一半）。T05 已把它并入
     // `apply-triggers.cjs` 的必需清单，脚本一条命令即可补齐。
@@ -3734,10 +5060,10 @@ export default (Plugin) => {
         setTimeout(() => start().catch((error) => (lastError.value = error.message || String(error))), 1500)
       }
     },
-    onCoreStopped: () => stop(true, true),
+    onCoreStopped: () => stopWithMarker(true, true),
     onDispose: () => {
       stopModalSync()
-      return stop(false, true)
+      return stopWithMarker(false, true)
     }
   }
 }
